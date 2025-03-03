@@ -3,7 +3,6 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
@@ -431,6 +430,9 @@ class MLPProj(torch.nn.Module):
         return clip_extra_context_tokens
 
 
+# region fps sampling and perceiver resampler
+
+
 class PerceiverResampler(nn.Module):
     """Implementation of the Perceiver Resampler from the Apollo paper"""
 
@@ -799,6 +801,9 @@ class WanModel(ModelMixin, ConfigMixin):
         if self.model_type == "i2v":
             assert clip_fea is not None and y is not None
 
+        if freqs.device != device:
+            freqs = freqs.to(device)
+
         # Apply temporal emphasis if provided
         if temporal_emphasis is not None:
             # Extract emphasis parameters
@@ -826,7 +831,7 @@ class WanModel(ModelMixin, ConfigMixin):
                     freqs * (1 - motion_smoothness) + freqs_temporal * motion_smoothness
                 )
 
-        if y is not None:
+        if y:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
         # embeddings

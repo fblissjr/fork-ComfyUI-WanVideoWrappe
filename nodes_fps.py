@@ -690,7 +690,7 @@ class WanVideoPerceiverResampler:
 
 
 # Register the new nodes
-NODE_CLASS_MAPPINGS = {
+NODE_CLASS_MAPPINGS_FPS = {
     "WanVideoContextOptionsFPS": WanVideoContextOptionsFPS,
     "WanVideoFPSSampler": WanVideoFPSSampler,
     "WanVideoLatentInterpolator": WanVideoLatentInterpolator,
@@ -698,7 +698,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoPerceiverResampler": WanVideoPerceiverResampler,
 }
 
-NODE_DISPLAY_NAME_MAPPINGS = {
+NODE_DISPLAY_NAME_MAPPINGS_FPS = {
     "WanVideoContextOptionsFPS": "WanVideo ContextOptions FPS",
     "WanVideoFPSSampler": "WanVideo FPS Sampler",
     "WanVideoLatentInterpolator": "WanVideo Latent Interpolator",
