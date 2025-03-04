@@ -32,7 +32,6 @@ import comfy.model_management as mm
 from comfy.utils import load_torch_file, save_torch_file, ProgressBar, common_upscale
 import comfy.model_base
 import comfy.latent_formats
-from comfy.clip_vision import clip_preprocess, ClipVisionModel
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -438,6 +437,7 @@ class WanVideoModelLoader:
         attention_mode="sdpa",
         block_swap_args=None,
         lora=None,
+        auto_cpu_offload=False,
         vram_management_args=None,
     ):
         assert not (vram_management_args is not None and block_swap_args is not None), (
@@ -473,8 +473,8 @@ class WanVideoModelLoader:
             if hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
                 torch.backends.cuda.matmul.allow_fp16_accumulation = True
             else:
-                raise ValueError(
-                    "torch.backends.cuda.matmul.allow_fp16_accumulation is not available in this version of torch, requires torch 2.7.0.dev2025 02 26 nightly minimum currently"
+                log.warning(
+                    "torch.backends.cuda.matmul.allow_fp16_accumulation is not available in this version of torch, requires torch 2.7.0 nightly currently"
                 )
         else:
             if hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
@@ -983,8 +983,8 @@ class LoadWanVideoClipTextEncoder:
             },
         }
 
-    RETURN_TYPES = ("CLIP_VISION",)
-    RETURN_NAMES = ("wan_clip_vision",)
+    RETURN_TYPES = ("WANCLIP",)
+    RETURN_NAMES = ("wan_clip_model",)
     FUNCTION = "loadmodel"
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Loads Hunyuan text_encoder model from 'ComfyUI/models/LLM'"
@@ -1028,7 +1028,6 @@ class WanVideoTextEncode:
     RETURN_NAMES = ("text_embeds",)
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Encodes text prompts into text embeddings. For context windowing you can input multiple prompts separated by '|'"
 
     def process(self, t5, positive_prompt, negative_prompt, force_offload=True):
         device = mm.get_torch_device()
@@ -1036,17 +1035,13 @@ class WanVideoTextEncode:
         encoder = t5["model"]
         dtype = t5["dtype"]
 
-        # Split positive prompts and process each
-        positive_prompts = [p.strip() for p in positive_prompt.split("|")]
-
         encoder.model.to(device)
 
         with torch.autocast(
             device_type=mm.get_autocast_device(device), dtype=dtype, enabled=True
         ):
-            context = encoder(positive_prompts, device)
+            context = encoder([positive_prompt], device)
             context_null = encoder([negative_prompt], device)
-
         context = [t.to(device) for t in context]
         context_null = [t.to(device) for t in context_null]
 
@@ -1061,38 +1056,13 @@ class WanVideoTextEncode:
         return (prompt_embeds_dict,)
 
 
-class WanVideoTextEmbedBridge:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "positive": ("CONDITIONING",),
-                "negative": ("CONDITIONING",),
-            },
-        }
-
-    RETURN_TYPES = ("WANVIDEOTEXTEMBEDS",)
-    RETURN_NAMES = ("text_embeds",)
-    FUNCTION = "process"
-    CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Bridge between ComfyUI native text embedding and WanVideoWrapper text embedding"
-
-    def process(self, positive, negative):
-        device = mm.get_torch_device()
-        prompt_embeds_dict = {
-            "prompt_embeds": positive[0][0].to(device),
-            "negative_prompt_embeds": negative[0][0].to(device),
-        }
-        return (prompt_embeds_dict,)
-
-
 # region clip image encode
 class WanVideoImageClipEncode:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "clip_vision": ("CLIP_VISION",),
+                "clip": ("WANCLIP",),
                 "image": ("IMAGE", {"tooltip": "Image to encode"}),
                 "vae": ("WANVAE",),
                 "generation_width": (
@@ -1175,7 +1145,7 @@ class WanVideoImageClipEncode:
 
     def process(
         self,
-        clip_vision,
+        clip,
         vae,
         image,
         num_frames,
@@ -1198,24 +1168,23 @@ class WanVideoImageClipEncode:
         H, W = image.shape[1], image.shape[2]
         max_area = generation_width * generation_height
 
-        print(clip_vision)
-        clip_vision.model.to(device)
-        if isinstance(clip_vision, ClipVisionModel):
-            clip_context = clip_vision.encode_image(image).last_hidden_state.to(device)
-        else:
-            pixel_values = clip_preprocess(
-                image.to(device),
-                size=224,
-                mean=self.image_mean,
-                std=self.image_std,
-                crop=True,
-            ).float()
-            clip_context = clip_vision.visual(pixel_values)
+        from comfy.clip_vision import clip_preprocess
+
+        pixel_values = clip_preprocess(
+            image.to(device),
+            size=224,
+            mean=self.image_mean,
+            std=self.image_std,
+            crop=True,
+        ).float()
+        clip.model.to(device)
+        clip_context = clip.visual(pixel_values)
+
         if clip_embed_strength != 1.0:
             clip_context *= clip_embed_strength
 
         if force_offload:
-            clip_vision.model.to(offload_device)
+            clip.model.to(offload_device)
             mm.soft_empty_cache()
 
         if adjust_resolution:
@@ -1464,16 +1433,10 @@ class WanVideoSampler:
                     {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01},
                 ),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
-                "force_offload": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip": "Moves the model to the offload device after sampling",
-                    },
-                ),
+                "force_offload": ("BOOLEAN", {"default": True}),
                 "scheduler": (
                     ["unipc", "dpm++", "dpm++_sde", "euler"],
-                    {"default": "unipc"},
+                    {"default": "dpm++"},
                 ),
                 "riflex_freq_index": (
                     "INT",
@@ -1482,7 +1445,7 @@ class WanVideoSampler:
                         "min": 0,
                         "max": 1000,
                         "step": 1,
-                        "tooltip": "Frequency index for RIFLEX, disabled when 0, default 6. Allows for new frames to be generated after without looping",
+                        "tooltip": "Frequency index for RIFLEX, disabled when 0, default 4. Allows for new frames to be generated after without looping",
                     },
                 ),
             },
@@ -1524,9 +1487,6 @@ class WanVideoSampler:
         context_options=None,
         teacache_args=None,
     ):
-        assert not (context_options and teacache_args), (
-            "Context options cannot currently be used together with teacache."
-        )
         patcher = model
         model = model.model
         transformer = model.diffusion_model
@@ -1610,24 +1570,23 @@ class WanVideoSampler:
 
         latent_video_length = noise.shape[1]
 
+        if samples is not None:
+            latent_timestep = timesteps[:1].to(noise)
+            noise = noise * latent_timestep / 1000 + (
+                1 - latent_timestep / 1000
+            ) * samples["samples"].squeeze(0).to(noise)
+
         if context_options is not None:
             context_schedule = context_options["context_schedule"]
             context_frames = (context_options["context_frames"] - 1) // 4 + 1
             context_stride = context_options["context_stride"] // 4
             context_overlap = context_options["context_overlap"] // 4
 
-            # Get total number of prompts
-            num_prompts = len(text_embeds["prompt_embeds"])
-            log.info(f"Number of prompts: {num_prompts}")
-            # Calculate which section this context window belongs to
-            section_size = latent_video_length / num_prompts
-            log.info(f"Section size: {section_size}")
-
             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * context_frames)
 
             if context_options["freenoise"]:
                 log.info("Applying FreeNoise")
-                # code from AnimateDiff-Evolved by Kosinkadink (https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved)
+                # code and comments from AnimateDiff-Evolved by Kosinkadink (https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved)
                 delta = context_frames - context_overlap
                 for start_idx in range(0, latent_video_length - context_frames, delta):
                     place_idx = start_idx + context_frames
@@ -1666,12 +1625,6 @@ class WanVideoSampler:
 
             context = get_context_scheduler(context_schedule)
 
-        if samples is not None:
-            latent_timestep = timesteps[:1].to(noise)
-            noise = noise * latent_timestep / 1000 + (
-                1 - latent_timestep / 1000
-            ) * samples["samples"].squeeze(0).to(noise)
-
         latent = noise.to(device)
 
         d = transformer.dim // transformer.num_heads
@@ -1694,12 +1647,23 @@ class WanVideoSampler:
 
         print("Seq len:", seq_len)
 
-        args = {
+        base_args = {
             "clip_fea": image_embeds.get("clip_context", None),
             "seq_len": seq_len,
             "device": device,
             "freqs": freqs,
         }
+        if transformer.model_type == "i2v":
+            base_args.update(
+                {
+                    "y": [image_embeds["image_embeds"]],
+                }
+            )
+
+        arg_c = base_args.copy()
+        arg_c.update({"context": [text_embeds["prompt_embeds"][0]]})
+        arg_null = base_args.copy()
+        arg_null.update({"context": text_embeds["negative_prompt_embeds"]})
 
         pbar = ProgressBar(steps)
 
@@ -1752,7 +1716,6 @@ class WanVideoSampler:
         else:
             transformer.enable_teacache = False
 
-        mm.unload_all_models()
         mm.soft_empty_cache()
         gc.collect()
 
@@ -1834,45 +1797,22 @@ class WanVideoSampler:
                     )
 
                     for c in context_queue:
-                        print(c)
-                        prompt_index = min(int(max(c) / section_size), num_prompts - 1)
-                        log.info(f"Prompt index: {prompt_index}")
-
-                        # Use the appropriate prompt for this section
-                        positive_prompt = text_embeds["prompt_embeds"][prompt_index]
-
-                        img_emb = image_embeds.get("image_embeds", None)
-                        partial_img_emb = None
-                        if img_emb is not None:
-                            partial_img_emb = img_emb[:, c, :, :]
-                            partial_img_emb[:, 0, :, :] = img_emb[:, 0, :, :].to(
-                                intermediate_device
-                            )
-
                         partial_latent_model_input = [latent_model_input[0][:, c, :, :]]
                         # Model inference - returns [frames, channels, height, width]
                         noise_pred_cond = transformer(
                             partial_latent_model_input,
-                            y=[partial_img_emb]
-                            if partial_img_emb is not None
-                            else None,
                             t=timestep,
                             current_step=i,
                             is_uncond=False,
-                            context=[positive_prompt],
-                            **args,
+                            **arg_c,
                         )[0].to(intermediate_device)
                         if cfg[i] != 1.0:
                             noise_pred_uncond = transformer(
                                 partial_latent_model_input,
-                                y=[partial_img_emb]
-                                if partial_img_emb is not None
-                                else None,
                                 t=timestep,
                                 current_step=i,
                                 is_uncond=True,
-                                context=text_embeds["negative_prompt_embeds"],
-                                **args,
+                                **arg_null,
                             )[0].to(intermediate_device)
 
                             noise_pred_context = noise_pred_uncond + cfg[i] * (
@@ -1909,23 +1849,15 @@ class WanVideoSampler:
                         t=timestep,
                         current_step=i,
                         is_uncond=False,
-                        y=[image_embeds["image_embeds"]]
-                        if "image_embeds" in image_embeds
-                        else [],
-                        context=[text_embeds["prompt_embeds"][0]],
-                        **args,
+                        **arg_c,
                     )[0].to(intermediate_device)
                     if cfg[i] != 1.0:
                         noise_pred_uncond = transformer(
                             latent_model_input,
-                            y=[image_embeds["image_embeds"]]
-                            if "image_embeds" in image_embeds
-                            else [],
                             t=timestep,
                             current_step=i,
                             is_uncond=True,
-                            context=text_embeds["negative_prompt_embeds"],
-                            **args,
+                            **arg_null,
                         )[0].to(intermediate_device)
 
                         noise_pred = noise_pred_uncond + cfg[i] * (
@@ -1975,8 +1907,8 @@ class WanVideoSampler:
                 mm.soft_empty_cache()
                 gc.collect()
 
+        print_memory(device)
         try:
-            print_memory(device)
             torch.cuda.reset_peak_memory_stats(device)
         except:
             pass
@@ -2344,8 +2276,8 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoContextOptions": WanVideoContextOptions,
     "WanVideoTeaCache": WanVideoTeaCache,
     "WanVideoVRAMManagement": WanVideoVRAMManagement,
-    "WanVideoTextEmbedBridge": WanVideoTextEmbedBridge,
 }
+
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
     "WanVideoDecode": "WanVideo Decode",
@@ -2355,7 +2287,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoVAELoader": "WanVideo VAE Loader",
     "LoadWanVideoT5TextEncoder": "Load WanVideo T5 TextEncoder",
     "WanVideoImageClipEncode": "WanVideo ImageClip Encode",
-    "LoadWanVideoClipTextEncoder": "Load WanVideo Clip Encoder",
+    "LoadWanVideoClipTextEncoder": "Load WanVideo Clip TextEncoder",
     "WanVideoEncode": "WanVideo Encode",
     "WanVideoBlockSwap": "WanVideo BlockSwap",
     "WanVideoTorchCompileSettings": "WanVideo Torch Compile Settings",
@@ -2367,5 +2299,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoContextOptions": "WanVideo Context Options",
     "WanVideoTeaCache": "WanVideo TeaCache",
     "WanVideoVRAMManagement": "WanVideo VRAM Management",
-    "WanVideoTextEmbedBridge": "WanVideo TextEmbed Bridge",
 }

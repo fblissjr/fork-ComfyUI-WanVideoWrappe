@@ -1,13 +1,15 @@
-# Apollo Paper Experimental Fork of [Kijai's ComfyUI wrapper nodes](https://github.com/kijai/ComfyUI-WanVideoWrapper) for [WanVideo](https://github.com/Wan-Video/Wan2.1)
+# FPS Sampling + Latent Interpolation of Wan2.1 Videos for Longer Video Sequences
 
-We need to make sure fps sampling and context window for fps sampling and the fps sampler and interpolation are all working accurately. I don't think they are.
-How does this change our context.pyand nodes.py nodes for WanVideoContextOptionsFPS, WanVideoFPSSampler, WanVideoLatentInterpolator, and if relevant, WanVideoSampler?
-Are there better places to implement this in the ./wanvideo/ sections of the code base?
-While you analyze that, let's also plan to fully implement Temporal Perception Emphasis, Perceiver Resampling, and tightly integrating it with the ./wanvideo/modules architecture, model, and potentially the solvers in ./wanvideo/utils
-Output the full code changes required.
+## Experimental Fork of [Kijai's ComfyUI wrapper nodes](https://github.com/kijai/ComfyUI-WanVideoWrapper) for [WanVideo](https://github.com/Wan-Video/Wan2.1)
+
+- I'm largely piggybacking off of Kijai's amazing work, particularly around context windowing here. He's enabled rapid experimentation for folks like me on bleeding edge tech. 🙏
 
 # FORK UPDATES
 
+- Added `WanVideoTemporalEmphasis`, `WanVideoPerceiverResampler` nodes per Apollo paper. Have not tested yet.
+- Added `WanVideoKeyframeConditioner` and `WanVideoKeyframeSampler` nodes. Have not tested these yet though.
+- Since all the nodes exposed various fps values that needed to sync up with the end result, I've simplified and created a new node, `FPSConfig`, that can override context options. You can still mess things up by not calculating fps * interpolation factor = final fps correcly, but you no longer need to ensure they match up in 3 different places. Just two now. :)
+- Completely separated out `nodes.py` and `nodes_fps.py`. This results in duplication of Sampler logic, but was necessary to keep momentum moving across both kijai's code and my own.
 - Added fps sampling for context windows as two new nodes - you need to use `WanVideoContextOptionsFPS` connected to a new sampler, `WanVideoFPSSampler`. Experimental. Very experimental.
 - Added `WanVideoLatentInterpolator` to interpolate frames in latent space, using with SLERP or Linear interpolation
 - inspiration: Apollo paper: [Apollo: An Exploration of Video Understanding in Large Multimodal Models](https://arxiv.org/abs/2412.10360)
