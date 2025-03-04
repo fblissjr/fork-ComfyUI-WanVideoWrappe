@@ -36,50 +36,12 @@ import comfy.model_management as mm
 from comfy.utils import load_torch_file, save_torch_file, ProgressBar, common_upscale
 import comfy.model_base
 import comfy.latent_formats
+import datetime
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 # region monkey patches for WanVideoSampler to avoid modifying sampler directly
 _original_process = WanVideoSampler.process
-
-
-# function to create debug visualization showing keyframe positions for keyframes + interpolated frames
-def debug_viz(total_latent_frames, keyframe_positions):
-    debug_image = torch.ones((100, total_latent_frames * 10, 3), dtype=torch.float32)
-    # Draw timeline
-    timeline_y = 50
-    debug_image[timeline_y - 1 : timeline_y + 2, :, :] = 0.7
-    # Mark keyframes
-    for pos in keyframe_positions:
-        x_pos = pos * 10 + 5
-        # Draw marker
-        debug_image[timeline_y - 10 : timeline_y + 10, x_pos - 2 : x_pos + 2, 0] = 1.0
-        debug_image[timeline_y - 10 : timeline_y + 10, x_pos - 2 : x_pos + 2, 1] = 0.2
-        debug_image[timeline_y - 10 : timeline_y + 10, x_pos - 2 : x_pos + 2, 2] = 0.2
-    # Mark interpolated frames
-    for i in range(total_latent_frames):
-        if i not in keyframe_positions:
-            x_pos = i * 10 + 5
-            # Draw smaller marker
-            debug_image[timeline_y - 5 : timeline_y + 5, x_pos - 1 : x_pos + 1, 0] = 0.2
-            debug_image[timeline_y - 5 : timeline_y + 5, x_pos - 1 : x_pos + 1, 1] = 0.2
-            debug_image[timeline_y - 5 : timeline_y + 5, x_pos - 1 : x_pos + 1, 2] = 1.0
-    # Add labels
-    for i, pos in enumerate(keyframe_positions):
-        x_pos = pos * 10
-        # Add frame number text
-        debug_image[timeline_y + 15 : timeline_y + 25, x_pos : x_pos + 10, :] = 0.5
-    # Print summary
-    log.info(
-        f"Generated video with {total_latent_frames} latent frames ({total_pixel_frames} pixel frames)"
-    )
-    log.info(f"Each second contains {output_fps} frames at {output_fps}fps")
-    log.info(
-        f"Using {interpolation_method} interpolation with {smoothness:.1f} smoothness"
-    )
-    log.info("===============================\n")
-    # Return the interpolated latents
-    return ({"samples": interpolated_latents.cpu()}, debug_image)
 
 
 # monkey patch
