@@ -565,41 +565,21 @@ class WanVideoFPSSampler:
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
-        # Add debug logging
-        log.info(f"DEBUG: Device: {device}, Offload device: {offload_device}")
-        log.info(f"DEBUG: Model type: {transformer.model_type}")
-        log.info(f"DEBUG: Sampling mode: {sampling_mode}")
-        log.info(f"DEBUG: Config: {config}")
-
         # Set up diffusion scheduler
         steps = int(steps / denoise_strength)
         timesteps, sample_scheduler = self._setup_scheduler(
             scheduler, shift, steps, device, denoise_strength
         )
 
-        log.info(
-            f"DEBUG: Scheduler setup complete. Steps: {steps}, Timesteps shape: {timesteps.shape}"
-        )
-
-        # Initialize latents with detailed logging
-        log.info(f"DEBUG: Initializing latents. Has samples: {samples is not None}")
+        # Initialize latents
         latent, latent_video_length = self._initialize_latents(
             image_embeds, samples, timesteps, seed, device
-        )
-
-        log.info(
-            f"DEBUG: Latent shape: {latent.shape}, Latent video length: {latent_video_length}"
-        )
-        log.info(
-            f"DEBUG: Latent min: {latent.min().item()}, max: {latent.max().item()}, mean: {latent.mean().item()}"
         )
 
         # Set up frequency parameters
         freqs = self._setup_frequencies(
             transformer, latent_video_length, riflex_freq_index, device
         )
-
-        log.info(f"DEBUG: Frequencies shape: {freqs.shape}")
 
         # Prepare arguments for model forward pass
         base_args, arg_c, arg_null = self._prepare_model_args(
@@ -611,47 +591,6 @@ class WanVideoFPSSampler:
             temporal_emphasis,
             perceiver_config,
         )
-
-        log.info(
-            f"DEBUG: Model args prepared. Text embeds length: {len(text_embeds['prompt_embeds'])}"
-        )
-
-        # Check for context windows
-
-        context_windows = None
-        if config.get("sampling_mode") == "fps" and "context_schedule" in config:
-            from .context import get_context_scheduler
-
-            context_schedule = config["context_schedule"]
-            context = get_context_scheduler(context_schedule)
-
-        # Generate window definitions with detailed logging
-        windows = list(
-            context(
-                0,  # step
-                None,  # num_steps
-                latent_video_length,
-                config.get("latent_context_frames", 21),
-                config.get("latent_context_stride", 17),
-                config.get("latent_context_overlap", 4),
-                config.get("target_fps", 4.0),
-                config.get("original_fps", 30.0),
-                True,  # closed_loop
-                config.get("enable_frame_blending", True),
-            )
-        )
-
-        total_frames = set()
-        for window in windows:
-            total_frames.update(window)
-
-        log.info(
-            f"DEBUG: Created {len(windows)} context windows covering {len(total_frames)}/{latent_video_length} frames"
-        )
-        for i, window in enumerate(windows):
-            log.info(f"DEBUG: Window {i}: {window}")
-
-        context_windows = windows
 
         # Enable FEtA if provided
         self._setup_feta(feta_args, config)
@@ -669,9 +608,6 @@ class WanVideoFPSSampler:
 
         # Set up context windows based on config
         context_windows = self._setup_context_windows(config, latent_video_length)
-
-        # From this point forward, add detailed logging in _process_by_windows and other key functions
-        # to track how the latents are being processed
 
         # Optional: Prepare frame blending if enabled
         blend_enabled = config.get("enable_frame_blending", False)
@@ -703,16 +639,9 @@ class WanVideoFPSSampler:
             enabled=True,
         ):
             for i, t in enumerate(tqdm(timesteps)):
-                # Log timestep info
-                log.info(f"DEBUG: Step {i}/{len(timesteps)}, t={t.item()}")
-
                 # Prepare inputs
                 latent_model_input = [latent.to(device)]
                 timestep = torch.tensor([t], device=device)
-
-                log.info(
-                    f"DEBUG: Latent model input shape: {latent_model_input[0].shape}"
-                )
 
                 # Calculate step percentage for FEtA and other control mechanisms
                 current_step_percentage = i / len(timesteps)
@@ -726,7 +655,7 @@ class WanVideoFPSSampler:
 
                 # Process by context windows if enabled
                 if context_windows:
-                    log.info(f"DEBUG: Processing with context windows")
+                    # Process by windows
                     noise_pred = self._process_by_windows(
                         context_windows,
                         latent_model_input[0],
@@ -738,11 +667,11 @@ class WanVideoFPSSampler:
                         arg_c,
                         arg_null,
                         intermediate_device,
-                        config.get("enable_frame_blending", True),
-                        window_indices={},
+                        blend_enabled,
+                        window_indices,
                     )
                 else:
-                    log.info(f"DEBUG: Processing without context windows")
+                    # Standard whole-frame processing
                     noise_pred = self._process_standard(
                         latent_model_input,
                         transformer,
@@ -752,69 +681,33 @@ class WanVideoFPSSampler:
                         cfg[i] if isinstance(cfg, list) else cfg,
                         arg_c,
                         arg_null,
-                        device,  # Use device directly here
+                        intermediate_device,
                         teacache_args is not None,
                     )
 
-                log.info(f"DEBUG: Noise pred shape: {noise_pred.shape}")
-                log.info(
-                    f"DEBUG: Noise pred min: {noise_pred.min().item()}, max: {noise_pred.max().item()}, mean: {noise_pred.mean().item()}"
-                )
-
-                # Move latent to device for scheduler step
-                latent = latent.to(device)
+                # Move latent to intermediate device for scheduler step
+                latent = latent.to(intermediate_device)
 
                 # Store previous latent for blending if enabled
                 if blend_enabled:
                     previous_latent = latent.clone()
 
-                ###################################
-                # Old code before Claude changed it just now to fix the noised videos
-                ###################################
-                # # Step the scheduler
-                # temp_x0 = sample_scheduler.step(
-                #     noise_pred.unsqueeze(0),
-                #     t,
-                #     latent.unsqueeze(0),
-                #     return_dict=False,
-                #     generator=torch.Generator(device=torch.device("cpu")).manual_seed(
-                #         seed
-                #     ),
-                # )[0]
-
                 # Step the scheduler
-                log.info(f"DEBUG: Stepping scheduler")
                 temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0) if noise_pred.dim() == 4 else noise_pred,
+                    noise_pred.unsqueeze(0),
                     t,
-                    latent.unsqueeze(0) if latent.dim() == 4 else latent,
+                    latent.unsqueeze(0),
                     return_dict=False,
                     generator=torch.Generator(device=torch.device("cpu")).manual_seed(
                         seed
                     ),
                 )[0]
 
-                log.info(
-                    f"DEBUG: Scheduler step complete. Output shape: {temp_x0.shape}"
-                )
-                log.info(
-                    f"DEBUG: Output min: {temp_x0.min().item()}, max: {temp_x0.max().item()}, mean: {temp_x0.mean().item()}"
-                )
-
                 # Update latent
-                latent = temp_x0.squeeze(0) if temp_x0.dim() == 5 else temp_x0
+                latent = temp_x0.squeeze(0)
 
-                log.info(
-                    f"DEBUG: Scheduler step complete. Output shape: {temp_x0.shape}"
-                )
-                log.info(
-                    f"DEBUG: Output min: {temp_x0.min().item()}, max: {temp_x0.max().item()}, mean: {temp_x0.mean().item()}"
-                )
-
-                # <help>Claude - do we need this??
                 # Prepare next iteration
                 x0 = [latent.to(device)]
-                # </help>
 
                 # Update progress display
                 if callback is not None:
@@ -827,26 +720,8 @@ class WanVideoFPSSampler:
                 else:
                     pbar.update(1)
 
-                # Update latent
-                latent = temp_x0.squeeze(0) if temp_x0.dim() == 5 else temp_x0
-
                 # Clean up to avoid OOM
                 del latent_model_input, timestep
-
-                log.info(
-                    f"DEBUG: Sampling complete. Final latent shape: {latent.shape}"
-                )
-                log.info(
-                    f"DEBUG: Final latent min: {latent.min().item()}, max: {latent.max().item()}, mean: {latent.mean().item()}"
-                )
-
-                return (
-                    {
-                        "samples": latent.unsqueeze(0).cpu()
-                        if latent.dim() == 4
-                        else latent.cpu()
-                    },
-                )
 
         # Report TeaCache stats if used
         if hasattr(transformer, "teacache_skipped_cond_steps"):
@@ -1244,56 +1119,22 @@ class WanVideoFPSSampler:
         window_indices,
     ):
         """Process sampling in context windows with optional frame blending"""
-        log.info(f"DEBUG: _process_by_windows start. Latent shape: {latent.shape}")
-
         # Zero-initialize noise prediction and counter tensors
         noise_pred = torch.zeros_like(latent, device=intermediate_device)
         counter = torch.zeros_like(latent, device=intermediate_device)
 
-        # Get total number of prompts
-        num_prompts = len(arg_c["context"])
-
-        # Calculate section size for prompt selection
-        section_size = (
-            latent.shape[1] / num_prompts
-            if latent.dim() == 4
-            else latent.shape[2] / num_prompts
-        )
-
         # Process each context window
         for window_idx, window_frames in enumerate(windows):
-            # Get the appropriate prompt for this section of the video
-            prompt_index = min(int(max(window_frames) / section_size), num_prompts - 1)
-
-            # Select the correct prompt
-            window_arg_c = arg_c.copy()
-            window_arg_c["context"] = [arg_c["context"][prompt_index]]
-
-            # Handle image embeddings if present
-            img_emb = arg_c.get("y", [None])[0]
-            partial_img_emb = None
-
-            if img_emb is not None:
-                if img_emb.dim() == 4:  # [c, t, h, w]
-                    partial_img_emb = img_emb[:, window_frames, :, :]
-                    partial_img_emb[:, 0, :, :] = img_emb[:, 0, :, :].to(
-                        intermediate_device
-                    )
-                else:  # [b, c, t, h, w]
-                    partial_img_emb = img_emb[:, :, window_frames, :, :]
-                    partial_img_emb[:, :, 0, :, :] = img_emb[:, :, 0, :, :].to(
-                        intermediate_device
-                    )
-
-                window_arg_c["y"] = [partial_img_emb]
-
             # Get the latent for this window
+            # Adjust indexing based on actual tensor shape
             if latent.dim() == 4:  # [c, t, h, w]
-                partial_latent = [latent[:, window_frames, :, :]]
+                partial_latent = latent[:, window_frames, :, :]
             else:  # [b, c, t, h, w]
-                partial_latent = [latent[:, :, window_frames, :, :]]
+                partial_latent = latent[:, :, window_frames, :, :]
 
-            # Keep track of which frames belong to this window for blending
+            partial_model_input = [partial_latent]
+
+            # Keep track of which frames belong to this window
             if blend_enabled:
                 for frame_idx in window_frames:
                     if frame_idx not in window_indices:
@@ -1302,17 +1143,17 @@ class WanVideoFPSSampler:
 
             # Perform conditional forward pass
             noise_pred_cond = transformer(
-                partial_latent,
+                partial_model_input,
                 t=timestep,
                 current_step=step_idx,
                 is_uncond=False,
-                **window_arg_c,
+                **arg_c,
             )[0].to(intermediate_device)
 
             # Perform unconditional forward pass if CFG > 1.0
             if cfg_scale != 1.0:
                 noise_pred_uncond = transformer(
-                    partial_latent,
+                    partial_model_input,
                     t=timestep,
                     current_step=step_idx,
                     is_uncond=True,
@@ -1325,39 +1166,18 @@ class WanVideoFPSSampler:
             else:
                 noise_pred_window = noise_pred_cond
 
-            # Create blending weights
-            window_mask = torch.ones_like(noise_pred_window)
-
-            # Apply left-side blending for all except first chunk
-            if window_idx > 0 and blend_enabled:
-                overlap_size = len(set(window_frames) & set(windows[window_idx - 1]))
-                if overlap_size > 0:
-                    ramp_up = torch.linspace(
-                        0, 1, overlap_size, device=noise_pred.device
-                    )
-                    if window_mask.dim() == 4:  # [c, t, h, w]
-                        ramp_up = ramp_up.view(1, -1, 1, 1)
-                        window_mask[:, :overlap_size, :, :] = ramp_up
-                    else:  # [b, c, t, h, w]
-                        ramp_up = ramp_up.view(1, 1, -1, 1, 1)
-                        window_mask[:, :, :overlap_size, :, :] = ramp_up
-
-            # Apply right-side blending for all except last chunk
-            if window_idx < len(windows) - 1 and blend_enabled:
-                overlap_size = len(set(window_frames) & set(windows[window_idx + 1]))
-                if overlap_size > 0:
-                    ramp_down = torch.linspace(
-                        1, 0, overlap_size, device=noise_pred.device
-                    )
-                    if window_mask.dim() == 4:  # [c, t, h, w]
-                        ramp_down = ramp_down.view(1, -1, 1, 1)
-                        window_mask[:, -overlap_size:, :, :] = ramp_down
-                    else:  # [b, c, t, h, w]
-                        ramp_down = ramp_down.view(1, 1, -1, 1, 1)
-                        window_mask[:, :, -overlap_size:, :, :] = ramp_down
+            # Create blending mask based on position in the window
+            window_mask = self._create_window_mask(
+                noise_pred_window,
+                window_frames,
+                window_idx,
+                len(windows),
+                window_indices if blend_enabled else None,
+            )
 
             # Apply the window's noise prediction to the global tensor
             for i, frame_idx in enumerate(window_frames):
+                # Adjust indexing based on actual tensor shape
                 if noise_pred.dim() == 4:  # [c, t, h, w]
                     noise_pred[:, frame_idx, :, :] += (
                         noise_pred_window[:, i, :, :] * window_mask[:, i, :, :]
