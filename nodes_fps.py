@@ -1550,6 +1550,7 @@ class WanVideoLatentInterpolator:
         context_options=None,
         fps_config=None,
         use_recommended_factor=True,
+        motion_smoothness=0.5,
     ):
         # First check fps_config (highest priority)
         if fps_config is not None and use_recommended_factor:
