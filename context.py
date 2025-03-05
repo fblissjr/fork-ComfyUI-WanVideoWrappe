@@ -347,15 +347,18 @@ def uniform_standard_fps(
             log.warning(
                 f"Warning: {len(missing_frames)} frames not covered by any context window"
             )
-            for frame in sorted(list(missing_frames)):
-                # Find closest window
-                closest_win_idx = min(
-                    range(len(windows)),
-                    key=lambda i: min(abs(f - frame) for f in windows[i]),
-                )
-                windows[closest_win_idx].append(frame)
-                # Sort the window
-                windows[closest_win_idx].sort()
+            log.info(
+                "skipping over this logic entirely just in case finding the closest window causes problems - the logic is commented out - remember to comment it back in later"
+            )
+            # for frame in sorted(list(missing_frames)):
+            #     # Find closest window
+            #     closest_win_idx = min(
+            #         range(len(windows)),
+            #         key=lambda i: min(abs(f - frame) for f in windows[i]),
+            #     )
+            #     windows[closest_win_idx].append(frame)
+            #     # Sort the window
+            #     windows[closest_win_idx].sort()
 
     return windows
 
