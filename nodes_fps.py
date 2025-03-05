@@ -1431,6 +1431,109 @@ class WanVideoEnhancedFPSSampler:
         else:
             transformer.enable_teacache = False
 
+    def _context_aware_interpolation(
+        self, latents, interpolated_latents, interpolation_factor, ease_method, t
+    ):
+        """
+        Interpolate with awareness of context window boundaries
+        """
+        # Step 1: Detect discontinuities between consecutive frames
+        frame_diffs = []
+        for i in range(t - 1):
+            diff = (
+                torch.abs(latents[:, :, i + 1, :, :] - latents[:, :, i, :, :])
+                .mean()
+                .item()
+            )
+            frame_diffs.append(diff)
+
+        # Skip discontinuity detection if we don't have enough frames
+        discontinuity_points = set()
+        if len(frame_diffs) > 2:
+            # Calculate mean and standard deviation to identify outliers
+            mean_diff = sum(frame_diffs) / len(frame_diffs)
+            std_diff = (
+                sum((d - mean_diff) ** 2 for d in frame_diffs) / len(frame_diffs)
+            ) ** 0.5
+
+            # Frames with differences > 2 standard deviations are likely boundaries
+            threshold = mean_diff + 2 * std_diff
+            for i, diff in enumerate(frame_diffs):
+                if diff > threshold:
+                    discontinuity_points.add(i)
+                    log.info(
+                        f"Detected context window boundary between frames {i} and {i + 1} (diff={diff:.4f}, threshold={threshold:.4f})"
+                    )
+
+        # Step 2: Apply interpolation, skipping discontinuity points
+        for i in range(t - 1):
+            # Skip interpolation across window boundaries
+            if i in discontinuity_points:
+                log.info(f"Skipping interpolation between frames {i} and {i + 1}")
+                continue
+
+            start_frame = latents[:, :, i, :, :]
+            end_frame = latents[:, :, i + 1, :, :]
+
+            # Interpolate frames
+            for j in range(1, interpolation_factor):
+                # Calculate position
+                alpha_raw = j / interpolation_factor
+                alpha = self._ease_function(alpha_raw, ease_method)
+
+                frame_idx = i * interpolation_factor + j
+
+                # Ensure we're not writing past the end of the tensor
+                if frame_idx < interpolated_latents.shape[2]:
+                    interpolated_latents[:, :, frame_idx, :, :] = (
+                        1 - alpha
+                    ) * start_frame + alpha * end_frame
+
+        # Step 3: Apply additional smoothing to areas around discontinuities
+        if discontinuity_points and interpolation_factor > 1:
+            smoothing_radius = interpolation_factor // 2
+            for disc_point in discontinuity_points:
+                # Calculate center frame in interpolated space
+                center_idx = disc_point * interpolation_factor
+
+                # Apply localized smoothing to frames around discontinuity
+                start_idx = max(0, center_idx - smoothing_radius)
+                end_idx = min(
+                    interpolated_latents.shape[2], center_idx + smoothing_radius + 1
+                )
+
+                # Simple temporal averaging
+                for i in range(start_idx, end_idx):
+                    neighbors = []
+                    weights = []
+
+                    # Collect valid neighboring frames
+                    for offset in range(-2, 3):
+                        if 0 <= i + offset < interpolated_latents.shape[2]:
+                            neighbors.append(
+                                interpolated_latents[:, :, i + offset, :, :]
+                            )
+                            # Use Gaussian-like weights centered on the current frame
+                            weights.append(math.exp(-0.5 * (offset**2)))
+
+                    # Normalize weights
+                    total_weight = sum(weights)
+                    weights = [w / total_weight for w in weights]
+
+                    # Apply weighted average
+                    smoothed_frame = torch.zeros_like(
+                        interpolated_latents[:, :, i, :, :]
+                    )
+                    for neighbor, weight in zip(neighbors, weights):
+                        smoothed_frame += neighbor * weight
+
+                    # Blend with original frame (50% original, 50% smoothed)
+                    interpolated_latents[:, :, i, :, :] = (
+                        0.5 * interpolated_latents[:, :, i, :, :] + 0.5 * smoothed_frame
+                    )
+
+        return interpolated_latents
+
     def _process_by_windows(
         self,
         windows,
@@ -1446,15 +1549,14 @@ class WanVideoEnhancedFPSSampler:
         blend_enabled,
         window_indices,
     ):
-        """Process sampling in context windows with optional frame blending"""
-        # Zero-initialize noise prediction and counter tensors
+        """Process sampling in context windows with improved frame blending"""
+        # Initialize noise prediction and counter tensors
         noise_pred = torch.zeros_like(latent, device=intermediate_device)
         counter = torch.zeros_like(latent, device=intermediate_device)
 
         # Process each context window
         for window_idx, window_frames in enumerate(windows):
             # Get the latent for this window
-            # Adjust indexing based on actual tensor shape
             if latent.dim() == 4:  # [c, t, h, w]
                 partial_latent = latent[:, window_frames, :, :]
             else:  # [b, c, t, h, w]
@@ -1494,14 +1596,73 @@ class WanVideoEnhancedFPSSampler:
             else:
                 noise_pred_window = noise_pred_cond
 
-            # Create blending mask based on position in the window
-            window_mask = self._create_window_mask(
-                noise_pred_window,
-                window_frames,
-                window_idx,
-                len(windows),
-                window_indices if blend_enabled else None,
-            )
+            # Create advanced blending mask for smoother transitions
+            window_mask = torch.ones_like(noise_pred_window)
+
+            if blend_enabled:
+                # Calculate overlap with previous and next windows
+                prev_window = windows[window_idx - 1] if window_idx > 0 else []
+                next_window = (
+                    windows[window_idx + 1] if window_idx < len(windows) - 1 else []
+                )
+
+                # Find shared frames with previous and next windows
+                overlap_prev = set(window_frames).intersection(set(prev_window))
+                overlap_next = set(window_frames).intersection(set(next_window))
+
+                # Create fade-in for frames shared with previous window
+                if overlap_prev:
+                    sorted_overlap = sorted(list(overlap_prev))
+                    total_prev = len(sorted_overlap)
+                    for frame_idx in sorted_overlap:
+                        # Get position in overlap sequence and in window
+                        pos = sorted_overlap.index(frame_idx)
+                        frame_pos = window_frames.index(frame_idx)
+
+                        # Calculate weight (0.0 → 1.0)
+                        weight = pos / max(1, total_prev - 1)
+                        # Apply smoother cubic easing
+                        weight = 3 * weight**2 - 2 * weight**3
+
+                        # Apply to the appropriate dimensions
+                        if window_mask.dim() == 4:  # [c, t, h, w]
+                            window_mask[:, frame_pos, :, :] = weight
+                        else:  # [b, c, t, h, w]
+                            window_mask[:, :, frame_pos, :, :] = weight
+
+                # Create fade-out for frames shared with next window
+                if overlap_next:
+                    sorted_overlap = sorted(list(overlap_next), reverse=True)
+                    total_next = len(sorted_overlap)
+                    for frame_idx in sorted_overlap:
+                        # Get position in overlap sequence and in window
+                        pos = sorted_overlap.index(frame_idx)
+                        frame_pos = window_frames.index(frame_idx)
+
+                        # Calculate weight (1.0 → 0.0)
+                        weight = pos / max(1, total_next - 1)
+                        # Apply smoother cubic easing
+                        weight = 3 * weight**2 - 2 * weight**3
+
+                        # Don't override fade-in weights, use minimum value for frames
+                        # that appear in both previous and next window overlaps
+                        if frame_idx in overlap_prev:
+                            if window_mask.dim() == 4:  # [c, t, h, w]
+                                current_weight = window_mask[:, frame_pos, :, :]
+                                window_mask[:, frame_pos, :, :] = torch.minimum(
+                                    current_weight, weight
+                                )
+                            else:  # [b, c, t, h, w]
+                                current_weight = window_mask[:, :, frame_pos, :, :]
+                                window_mask[:, :, frame_pos, :, :] = torch.minimum(
+                                    current_weight, weight
+                                )
+                        else:
+                            # No overlap with previous, just set the weight
+                            if window_mask.dim() == 4:  # [c, t, h, w]
+                                window_mask[:, frame_pos, :, :] = weight
+                            else:  # [b, c, t, h, w]
+                                window_mask[:, :, frame_pos, :, :] = weight
 
             # Apply the window's noise prediction to the global tensor
             for i, frame_idx in enumerate(window_frames):
@@ -2728,6 +2889,70 @@ class WanVideoLatentInterpolator:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Interpolates between latent frames for smoother video with higher effective frame rates."
 
+    def _context_aware_interpolation(
+        self, latents, interpolated_latents, interpolation_factor, ease_method, t
+    ):
+        """
+        Interpolate with awareness of context window boundaries
+        """
+        # First, identify which frames came from which context windows
+        # This requires passing context window information from the sampler
+
+        # 1. Create a map of frame indices that should NOT be interpolated between
+        discontinuity_points = set()
+
+        # Step 1: Detect large discontinuities between consecutive frames
+        # These likely indicate window boundaries
+        frame_diffs = []
+        for i in range(t - 1):
+            diff = (
+                torch.abs(latents[:, :, i + 1, :, :] - latents[:, :, i, :, :])
+                .mean()
+                .item()
+            )
+            frame_diffs.append(diff)
+
+        if len(frame_diffs) > 1:
+            # Calculate mean and standard deviation to identify outliers
+            mean_diff = sum(frame_diffs) / len(frame_diffs)
+            std_diff = (
+                sum((d - mean_diff) ** 2 for d in frame_diffs) / len(frame_diffs)
+            ) ** 0.5
+
+            # Frames with differences > 2 standard deviations are likely boundaries
+            threshold = mean_diff + 2 * std_diff
+            for i, diff in enumerate(frame_diffs):
+                if diff > threshold:
+                    discontinuity_points.add(i)
+                    log.info(
+                        f"Detected context window boundary between frames {i} and {i + 1}"
+                    )
+
+        # 2. Apply interpolation, skipping discontinuity points
+        for i in range(t - 1):
+            # Skip interpolation across window boundaries
+            if i in discontinuity_points:
+                continue
+
+            start_frame = latents[:, :, i, :, :]
+            end_frame = latents[:, :, i + 1, :, :]
+
+            # Interpolate frames
+            for j in range(1, interpolation_factor):
+                # Calculate position
+                alpha_raw = j / interpolation_factor
+                alpha = self._ease_function(alpha_raw, ease_method)
+
+                frame_idx = i * interpolation_factor + j
+
+                # Ensure we're not writing past the end of the tensor
+                if frame_idx < interpolated_latents.shape[2]:
+                    interpolated_latents[:, :, frame_idx, :, :] = (
+                        1 - alpha
+                    ) * start_frame + alpha * end_frame
+
+        return interpolated_latents
+
     def interpolate(
         self,
         samples,
@@ -2794,9 +3019,20 @@ class WanVideoLatentInterpolator:
 
         # Copy original frames to their positions in the interpolated sequence
         for i in range(t):
-            interpolated_latents[:, :, i * interpolation_factor, :, :] = latents[
-                :, :, i, :, :
-            ]
+            interp_idx = i * interpolation_factor
+            if interp_idx < interpolated_t:
+                interpolated_latents[:, :, interp_idx, :, :] = latents[:, :, i, :, :]
+
+        # Use context-aware interpolation instead of method-specific approaches
+        interpolated_latents = self._context_aware_interpolation(
+            latents, interpolated_latents, interpolation_factor, ease_method, t
+        )
+
+        # Apply temporal smoothing if requested
+        if motion_smoothness > 0:
+            interpolated_latents = self._apply_temporal_smoothing(
+                interpolated_latents, strength=motion_smoothness
+            )
 
         # Apply the selected interpolation method
         if method == "debug_simple":
@@ -2831,12 +3067,6 @@ class WanVideoLatentInterpolator:
                 w,
                 b,
                 c,
-            )
-
-        # Apply temporal smoothing if requested
-        if motion_smoothness > 0:
-            interpolated_latents = self._apply_temporal_smoothing(
-                interpolated_latents, strength=motion_smoothness
             )
 
         # Generate debug visualization if requested
@@ -2886,6 +3116,7 @@ class WanVideoLatentInterpolator:
                 debug_image = torch.zeros((100, 400, 3))
 
         log.info(f"Interpolation complete: {t} frames → {interpolated_t} frames")
+
         return ({"samples": interpolated_latents}, debug_image)
 
     def _apply_simplified_interpolation(

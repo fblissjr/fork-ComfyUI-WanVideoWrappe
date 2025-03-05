@@ -212,153 +212,48 @@ def static_standard(
 
 # FPS-based uniform standard scheduler
 def uniform_standard_fps(
-    step: int = ...,
-    num_steps: Optional[int] = None,
-    num_frames: int = ...,
-    context_size: Optional[int] = None,
-    context_stride: int = 3,
-    context_overlap: int = 4,
-    target_fps: float = 2.0,
-    original_fps: float = 30.0,
-    closed_loop: bool = True,
-    enable_frame_blending: bool = True,
+    step,
+    num_steps,
+    num_frames,
+    context_size,
+    context_stride,
+    context_overlap,
+    target_fps=2.0,
+    original_fps=30.0,
+    closed_loop=True,
+    enable_frame_blending=True,
 ):
-    """
-    Creates context windows based on consistent FPS sampling as recommended in the Apollo paper
-    With enhanced frame blending and latent space handling
-    """
     windows = []
     if num_frames <= context_size:
         windows.append(list(range(num_frames)))
         return windows
 
-    # Convert pixel space values to latent space
-    latent_stride = 4  # 4 pixel frames = 1 latent frame in WanVideo
-    seconds_per_latent_frame = latent_stride / original_fps
-    video_length_sec = num_frames * seconds_per_latent_frame
+    # Calculate window stride with guaranteed overlap
+    window_stride = max(1, context_size - context_overlap)
 
-    # Calculate window timing in seconds
-    window_duration_sec = context_size * seconds_per_latent_frame
-    window_stride_sec = (context_size - context_overlap) * seconds_per_latent_frame
+    # Create windows with sequential frames for better interpolation
+    for start_idx in range(0, num_frames, window_stride):
+        end_idx = min(start_idx + context_size, num_frames)
 
-    # Important: Calculate frame density based on target_fps
-    frame_density = target_fps * seconds_per_latent_frame  # Frames per latent frame
-    log.info(f"Frame density (target frames per latent frame): {frame_density:.2f}")
+        # For final window, adjust to maintain constant size if possible
+        if end_idx - start_idx < context_size and start_idx > 0:
+            start_idx = max(0, end_idx - context_size)
 
-    # Generate windows based on temporal position
-    for window_start_sec in np.arange(0, video_length_sec, window_stride_sec):
-        # Calculate frame indices for this time window
-        start_frame = int(window_start_sec / seconds_per_latent_frame)
-        end_frame = min(start_frame + context_size, num_frames)
+        window = list(range(start_idx, end_idx))
+        windows.append(window)
 
-        # Ensure we maintain context_size frames per window when possible
-        if end_frame - start_frame < context_size and start_frame > 0:
-            start_frame = max(0, end_frame - context_size)
+    # Record frame mappings for debugging
+    frame_map = {}
+    for i, window in enumerate(windows):
+        for frame in window:
+            if frame not in frame_map:
+                frame_map[frame] = []
+            frame_map[frame].append(i)
 
-        # Create the window of sequential frames
-        if frame_density < 1.0:
-            # We need to subsample frames within the window
-            window_duration = (end_frame - start_frame) * seconds_per_latent_frame
-            frames_at_target_fps = max(2, int(window_duration * target_fps))
-            frames_at_target_fps = min(frames_at_target_fps, end_frame - start_frame)
-
-            # Evenly sample frames
-            indices = np.linspace(start_frame, end_frame - 1, frames_at_target_fps)
-            window_frames = [int(idx) for idx in indices]
-        else:
-            # Use all frames in the window
-            window_frames = list(range(start_frame, end_frame))
-
-        windows.append(window_frames)
-        if end_frame >= num_frames:
-            break
-
-    # The frame coverage logic and overlap handling remains mostly the same...
-
-    # Check for gaps between windows and add frames to bridge them
-    if enable_frame_blending:
-        for i in range(len(windows) - 1):
-            last_frame_in_window = windows[i][-1]
-            first_frame_in_next = windows[i + 1][0]
-
-            if first_frame_in_next - last_frame_in_window > 1:
-                # There's a gap - add frames to bridge it
-                gap_frames = list(range(last_frame_in_window + 1, first_frame_in_next))
-
-                # Determine which window should get these frames
-                gap_size = len(gap_frames)
-                if gap_size <= context_overlap:
-                    # Small gap, extend both windows to create overlap
-                    mid_point = gap_size // 2
-                    windows[i].extend(gap_frames[: mid_point + 1])
-                    windows[i + 1] = gap_frames[mid_point:] + windows[i + 1]
-                else:
-                    # Large gap, create a new context window
-                    mid_point = (
-                        last_frame_in_window
-                        + (first_frame_in_next - last_frame_in_window) // 2
-                    )
-                    new_window = list(
-                        range(
-                            max(0, mid_point - context_size // 2),
-                            min(num_frames, mid_point + context_size // 2),
-                        )
-                    )
-                    windows.insert(i + 1, new_window)
-
-    # Handle window overlap and consistency
-    delete_idxs = []
-    win_i = 0
-    while win_i < len(windows):
-        # Check for rollovers in cyclic video
-        is_roll, roll_idx = does_window_roll_over(windows[win_i], num_frames)
-        if is_roll:
-            roll_val = windows[win_i][roll_idx]
-            shift_window_to_end(windows[win_i], num_frames=num_frames)
-
-            # Check if next window is missing roll_val
-            if win_i + 1 < len(windows) and roll_val not in windows[win_i + 1]:
-                # Add a new window to cover the gap
-                windows.insert(
-                    win_i + 1,
-                    list(range(roll_val, min(roll_val + context_size, num_frames))),
-                )
-
-        # Delete duplicate windows
-        for pre_i in range(0, win_i):
-            if windows[win_i] == windows[pre_i]:
-                delete_idxs.append(win_i)
-                break
-        win_i += 1
-
-    # Remove duplicates
-    delete_idxs.reverse()
-    for i in delete_idxs:
-        windows.pop(i)
-
-    # Ensure all frames are covered
-    if enable_frame_blending:
-        covered_frames = set()
-        for window in windows:
-            covered_frames.update(window)
-
-        missing_frames = set(range(num_frames)) - covered_frames
-        if missing_frames:
-            log.warning(
-                f"Warning: {len(missing_frames)} frames not covered by any context window"
-            )
-            log.info(
-                "skipping over this logic entirely just in case finding the closest window causes problems - the logic is commented out - remember to comment it back in later"
-            )
-            # for frame in sorted(list(missing_frames)):
-            #     # Find closest window
-            #     closest_win_idx = min(
-            #         range(len(windows)),
-            #         key=lambda i: min(abs(f - frame) for f in windows[i]),
-            #     )
-            #     windows[closest_win_idx].append(frame)
-            #     # Sort the window
-            #     windows[closest_win_idx].sort()
+    # Log frames that appear in multiple windows (potential overlap issues)
+    multi_window_frames = {f: ws for f, ws in frame_map.items() if len(ws) > 1}
+    if multi_window_frames:
+        log.info(f"Found {len(multi_window_frames)} frames in multiple windows")
 
     return windows
 
