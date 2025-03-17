@@ -26,7 +26,6 @@ import comfy.model_base
 import comfy.latent_formats
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
 from comfy.sd import load_lora_for_models
-from .context import feature_aware_context_window
 
 from .granular_text_encode import WanVideoGranularTextEncode
 from .smart_context_sampler import WanVideoSmartSampler
