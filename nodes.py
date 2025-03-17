@@ -2266,123 +2266,6 @@ class WanVideoLatentPreview:
 
         return (latent_images.float().cpu(), out_factors)
 
-class WanVideoSpectreContextEnhancer:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "prompt": ("STRING", {"multiline": True}),
-                "context_size": (
-                    "INT",
-                    {"default": 81, "min": 16, "max": 256, "step": 1},
-                ),
-                "context_overlap": (
-                    "INT",
-                    {"default": 16, "min": 4, "max": 64, "step": 1},
-                ),
-                "context_stride": (
-                    "INT",
-                    {"default": 3, "min": 1, "max": 10, "step": 1},
-                ),
-                "closed_loop": ("BOOLEAN", {"default": True}),
-                "contra_path": (
-                    "STRING",
-                    {"default": "thesephist/contra-bottleneck-t5-large-wikipedia"},
-                ),
-                "spectre_name": ("STRING", {"default": "lg-v6"}),
-            }
-        }
-
-    RETURN_TYPES = ("WANVIDCONTEXT", "STRING")
-    RETURN_NAMES = ("context_options", "feature_info")
-    FUNCTION = "enhance_context"
-    CATEGORY = "WanVideoWrapper"
-
-    def enhance_context(
-        self,
-        prompt,
-        context_size,
-        context_overlap,
-        context_stride,
-        closed_loop,
-        contra_path,
-        spectre_name,
-    ):
-        # This would typically load models, but for quick demo we'll just simulate
-        # You'd need to have the proper imports and model loading code here
-
-        # Simulate feature extraction
-        # In real implementation, you'd do:
-        # extractor = SpectreFeatureExtractor(contra, spectre, features)
-        # top_features = extractor.extract_top_features(prompt)
-
-        # For demo, let's simulate some features based on prompt keywords
-        feature_indices = []
-        feature_values = []
-        feature_descriptions = []
-
-        if (
-            "color" in prompt.lower()
-            or "blue" in prompt.lower()
-            or "red" in prompt.lower()
-        ):
-            feature_indices.append(345)
-            feature_values.append(0.9)
-            feature_descriptions.append("Presence of color names")
-
-        if "driving" in prompt.lower() or "car" in prompt.lower():
-            feature_indices.append(2198)
-            feature_values.append(0.8)
-            feature_descriptions.append("Driving/cars")
-
-        if (
-            "emotion" in prompt.lower()
-            or "feel" in prompt.lower()
-            or "happy" in prompt.lower()
-        ):
-            feature_indices.append(596)
-            feature_values.append(0.7)
-            feature_descriptions.append("Emotions")
-
-        # Use the detected features to modify context parameters
-        context_size, context_overlap, context_stride, closed_loop = (
-            feature_aware_context_window(
-                feature_indices,
-                feature_values,
-                context_size,
-                context_overlap,
-                context_stride,
-                closed_loop,
-            )
-        )
-
-        # Prepare feature info string
-        feature_info = "\n".join(
-            [
-                f"Feature #{idx}: {desc} (value: {val:.2f})"
-                for idx, val, desc in zip(
-                    feature_indices, feature_values, feature_descriptions
-                )
-            ]
-        )
-        if not feature_info:
-            feature_info = "No significant features detected in prompt."
-
-        # Return enhanced context parameters
-        context_options = {
-            "context_schedule": "uniform_standard",
-            "context_frames": context_size,
-            "context_stride": context_stride,
-            "context_overlap": context_overlap,
-            "freenoise": True,
-            "verbose": False,
-        }
-
-        return (
-            context_options,
-            f"Enhanced context parameters based on Spectre features:\n{feature_info}\n\nParameters:\nSize: {context_size}, Overlap: {context_overlap}, Stride: {context_stride}",
-        )
-
 
 NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
@@ -2408,7 +2291,6 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoFlowEdit": WanVideoFlowEdit,
     "WanVideoControlEmbeds": WanVideoControlEmbeds,
     "WanVideoSLG": WanVideoSLG,
-    "WanVideoSpectreContextEnhancer": WanVideoSpectreContextEnhancer,
     "WanVideoGranularTextEncode": WanVideoGranularTextEncode,
     "WanVideoSmartSampler": WanVideoSmartSampler,
 }
@@ -2437,7 +2319,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoFlowEdit": "WanVideo FlowEdit",
     "WanVideoControlEmbeds": "WanVideo Control Embeds",
     "WanVideoSLG": "WanVideo SLG",
-    "WanVideoSpectreContextEnhancer": "WanVideoSpectreContextEnhancer",
     "WanVideoGranularTextEncode": "WanVideo Granular TextEncode",
     "WanVideoSmartSampler": "WanVideo Smart Sampler",
 }
