@@ -1,6 +1,12 @@
 import torch
 import logging
 import comfy.model_management as mm
+import traceback
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+log = logging.getLogger(__name__)
 
 class WanVideoGranularTextEncode:
     @classmethod
@@ -18,6 +24,8 @@ class WanVideoGranularTextEncode:
             "optional": {
                 "force_offload": ("BOOLEAN", {"default": True}),
                 "model_to_offload": ("WANVIDEOMODEL", {"tooltip": "Model to move to offload_device before encoding"}),
+                "fixed_sequence_length": ("INT", {"default": 0, "min": 0, "max": 30, 
+                                      "tooltip": "Force all embeddings to same sequence length (0=disabled)"})
             }
         }
 
@@ -27,13 +35,60 @@ class WanVideoGranularTextEncode:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Creates granular text embeddings with smooth transitions between main prompts"
 
+    def normalize_embedding_shapes(self, embeddings, target_length=None):
+        """Normalize embeddings to have consistent shapes"""
+        if not embeddings or len(embeddings) < 2:
+            return embeddings
+            
+        # Get device and dtype info
+        device = embeddings[0].device
+        dtype = embeddings[0].dtype
+        
+        # Get feature dimension (last dimension)
+        feature_dim = embeddings[0].shape[-1]
+        
+        # Get sequence lengths 
+        seq_lengths = [e.shape[0] for e in embeddings]
+        log.info(f"DEBUG: Original embedding shapes: {seq_lengths}")
+        
+        # Set target length to max if not specified
+        if target_length is None or target_length <= 0:
+            target_length = max(seq_lengths)
+            log.info(f"DEBUG: Using max sequence length: {target_length}")
+        
+        # Process each embedding
+        normalized = []
+        for i, embed in enumerate(embeddings):
+            curr_len = embed.shape[0]
+            
+            if curr_len < target_length:
+                # Pad with zeros
+                log.info(f"DEBUG: Padding embedding {i} from {curr_len} to {target_length}")
+                padding = torch.zeros(
+                    target_length - curr_len, feature_dim, device=device, dtype=dtype
+                )
+                normalized.append(torch.cat([embed, padding], dim=0))
+            elif curr_len > target_length:
+                # Truncate to target length
+                log.info(f"DEBUG: Truncating embedding {i} from {curr_len} to {target_length}")
+                normalized.append(embed[:target_length])
+            else:
+                # Already the right length
+                normalized.append(embed)
+                
+        # Double-check result
+        final_shapes = [e.shape for e in normalized]
+        log.info(f"DEBUG: Normalized embedding shapes: {final_shapes}")
+        
+        return normalized
+
     def process(self, t5, base_prompts, negative_prompt, transition_strength, transition_count,
-                force_offload=True, model_to_offload=None):
+                force_offload=True, model_to_offload=None, fixed_sequence_length=0):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
         if model_to_offload is not None:
-            logging.info(f"Moving video model to {offload_device}")
+            log.info(f"Moving video model to {offload_device}")
             model_to_offload.model.to(offload_device)
             mm.soft_empty_cache()
 
@@ -75,16 +130,36 @@ class WanVideoGranularTextEncode:
                         transition_prompt = f"{current_prompt} ({1-blend:.2f}), {next_prompt} ({blend:.2f})"
                     all_prompts.append(transition_prompt)
         
-        logging.info(f"Generated {len(all_prompts)} prompts: {all_prompts}")
+        log.info(f"Generated {len(all_prompts)} prompts: {all_prompts}")
         
         # Move encoder to device for processing
         encoder.model.to(device)
         
         # Encode all prompts
-        with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype, enabled=True):
-            context = encoder(all_prompts, device)
-            context_null = encoder([negative_prompt], device)
-
+        try:
+            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype, enabled=True):
+                context = encoder(all_prompts, device)
+                context_null = encoder([negative_prompt], device)
+                
+            # Print shape info for debugging
+            log.info(f"DEBUG: Embedding shapes before normalization: {[t.shape for t in context]}")
+            
+            # Apply shape normalization if enabled
+            if fixed_sequence_length > 0:
+                log.info(f"DEBUG: Normalizing embeddings to fixed length: {fixed_sequence_length}")
+                context = self.normalize_embedding_shapes(context, fixed_sequence_length)
+            elif any(t.shape[0] != context[0].shape[0] for t in context):
+                log.info(f"DEBUG: Embeddings have inconsistent shapes, normalizing...")
+                context = self.normalize_embedding_shapes(context)
+                
+        except Exception as e:
+            log.info(f"ERROR during encoding: {str(e)}")
+            log.info(traceback.format_exc())
+            # Fallback to basic encoding if something goes wrong
+            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype, enabled=True):
+                context = encoder([all_prompts[0]], device)
+                context_null = encoder([negative_prompt], device)
+                
         # Move everything to the right device
         context = [t.to(device) for t in context]
         context_null = [t.to(device) for t in context_null]
