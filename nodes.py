@@ -683,7 +683,42 @@ class WanVideoVAELoader:
         return (vae,)
 
 
+class WanVideoTinyVAELoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model_name": (folder_paths.get_filename_list("vae_approx"), {"tooltip": "These models are loaded from 'ComfyUI/models/vae_approx'"}),
+            },
+            "optional": {
+                "precision": (["fp16", "fp32", "bf16"],
+                    {"default": "fp16"}
+                ),
+            }
+        }
 
+    RETURN_TYPES = ("WANVAE",)
+    RETURN_NAMES = ("vae", )
+    FUNCTION = "loadmodel"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Loads Wan VAE model from 'ComfyUI/models/vae'"
+
+    def loadmodel(self, model_name, precision):
+        from .taehv import TAEHV
+
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+
+        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
+        model_path = folder_paths.get_full_path("vae_approx", model_name)
+        vae_sd = load_torch_file(model_path, safe_load=True)
+        
+        vae = TAEHV(vae_sd)
+       
+        vae.to(device = offload_device, dtype = dtype)
+
+        return (vae,)
+    
 class WanVideoTorchCompileSettings:
     @classmethod
     def INPUT_TYPES(s):
@@ -2327,6 +2362,8 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoSLG": WanVideoSLG,
     "WanVideoGranularTextEncode": WanVideoGranularTextEncode,
     "WanVideoSmartSampler": WanVideoSmartSampler,
+    "WanVideoTinyVAELoader": WanVideoTinyVAELoader,
+    "WanVideoLoopArgs": WanVideoLoopArgs
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2356,4 +2393,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSLG": "WanVideo SLG",
     "WanVideoGranularTextEncode": "WanVideo Granular TextEncode",
     "WanVideoSmartSampler": "WanVideo Smart Sampler",
+    "WanVideoTinyVAELoader": "WanVideo Tiny VAE Loader",
+    "WanVideoLoopArgs": "WanVideo Loop Args"
 }
