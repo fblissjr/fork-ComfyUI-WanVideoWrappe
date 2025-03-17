@@ -1219,6 +1219,8 @@ class WanVideoLoopArgs:
     def INPUT_TYPES(s):
         return {"required": {
                 "shift_skip": ("INT", {"default": 6, "min": 0, "tooltip": "Skip step of latent shift"}),
+                "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Start percent of the looping effect"}),
+                "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "End percent of the looping effect"}),
             },
         }
 
@@ -1660,6 +1662,8 @@ class WanVideoSampler:
             latent_shift_loop = True
             is_looped = True
             latent_skip = loop_args["shift_skip"]
+            latent_shift_start_percent = loop_args["start_percent"]
+            latent_shift_end_percent = loop_args["end_percent"]
             shift_idx = 0
         #main loop start
         for idx, t in enumerate(tqdm(timesteps)):    
@@ -1681,12 +1685,13 @@ class WanVideoSampler:
 
             latent_model_input = latent.to(device)
 
-            ### latent shift
-            if latent_shift_loop:
-                latent_model_input = torch.cat([latent_model_input[:, shift_idx:]] + [latent_model_input[:, :shift_idx]], dim=1)
-
             timestep = torch.tensor([t]).to(device)
             current_step_percentage = idx / len(timesteps)
+
+            ### latent shift
+            if latent_shift_loop:
+                if latent_shift_start_percent <= current_step_percentage <= latent_shift_end_percent:
+                    latent_model_input = torch.cat([latent_model_input[:, shift_idx:]] + [latent_model_input[:, :shift_idx]], dim=1)
 
             #enhance-a-video
             if feta_args is not None:
@@ -2056,8 +2061,9 @@ class WanVideoSampler:
 
             if latent_shift_loop:
                 #reverse latent shift
-                noise_pred = torch.cat([noise_pred[:, latent_video_length - shift_idx:]] + [noise_pred[:, :latent_video_length - shift_idx]], dim=1)
-                shift_idx = (shift_idx + latent_skip) % latent_video_length
+                if latent_shift_start_percent <= current_step_percentage <= latent_shift_end_percent:
+                    noise_pred = torch.cat([noise_pred[:, latent_video_length - shift_idx:]] + [noise_pred[:, :latent_video_length - shift_idx]], dim=1)
+                    shift_idx = (shift_idx + latent_skip) % latent_video_length
                 
             
             if flowedit_args is None:
