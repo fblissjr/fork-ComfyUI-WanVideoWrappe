@@ -101,11 +101,11 @@ class WanVideoGranularTextEncode:
         else:
             # Handle as single prompt
             main_prompts = [base_prompts]
-            
+
         if len(main_prompts) < 2:
             # If only one prompt, duplicate it to ensure we have at least two
             main_prompts.append(main_prompts[0])
-        
+
         # Generate all prompts including transitions
         all_prompts = []
         

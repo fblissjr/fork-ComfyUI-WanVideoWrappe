@@ -15,6 +15,7 @@ from .wanvideo.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 
 from .enhance_a_video.globals import enable_enhance, disable_enhance, set_enhance_weight, set_num_frames
+from .taehv import TAEHV
 
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
@@ -682,7 +683,6 @@ class WanVideoVAELoader:
 
         return (vae,)
 
-
 class WanVideoTinyVAELoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -718,7 +718,7 @@ class WanVideoTinyVAELoader:
         vae.to(device = offload_device, dtype = dtype)
 
         return (vae,)
-    
+
 class WanVideoTorchCompileSettings:
     @classmethod
     def INPUT_TYPES(s):
@@ -1263,6 +1263,8 @@ class WanVideoSampler:
                 "flowedit_args": ("FLOWEDITARGS", ),
                 "batched_cfg": ("BOOLEAN", {"default": False, "tooltip": "Batc cond and uncond for faster sampling, possibly faster on some hardware, uses more memory"}),
                 "slg_args": ("SLGARGS", ),
+                "rope_function": (["default", "comfy"], {"default": "default", "tooltip": "!EXPERIMENTAL! Comfy's RoPE implementation doesn't use complex numbers and can thus be compiled, that should be a lot faster when using torch.compile"}),
+                "loop_args": ("LOOPARGS", ),
             }
         }
 
@@ -1273,7 +1275,7 @@ class WanVideoSampler:
 
     def process(self, model, text_embeds, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, 
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None, 
-        teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None):
+        teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None):
         #assert not (context_options and teacache_args), "Context options cannot currently be used together with teacache."
         patcher = model
         model = model.model
@@ -1446,16 +1448,24 @@ class WanVideoSampler:
 
         latent = noise.to(device)
 
-        d = transformer.dim // transformer.num_heads
-        freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6), L_test=latent_video_length, k=riflex_freq_index),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ],
-        dim=1)
+        freqs = None
+        transformer.rope_embedder.k = None
+        transformer.rope_embedder.num_frames = None
+        if rope_function=="comfy":
+            transformer.rope_embedder.k = riflex_freq_index
+            transformer.rope_embedder.num_frames = latent_video_length
+        else:
+            d = transformer.dim // transformer.num_heads
+            freqs = torch.cat([
+                rope_params(1024, d - 4 * (d // 6), L_test=latent_video_length, k=riflex_freq_index),
+                rope_params(1024, 2 * (d // 6)),
+                rope_params(1024, 2 * (d // 6))
+            ],
+            dim=1)
 
         if not isinstance(cfg, list):
             cfg = [cfg] * (steps +1)
+
 
         print("Seq len:", seq_len)
            
@@ -1466,19 +1476,21 @@ class WanVideoSampler:
 
         #blockswap init
         if model["block_swap_args"] is not None:
+            transformer.use_non_blocking = model["block_swap_args"].get("use_non_blocking", True)
             for name, param in transformer.named_parameters():
                 if "block" not in name:
                     param.data = param.data.to(device)
                 elif model["block_swap_args"]["offload_txt_emb"] and "txt_emb" in name:
-                    param.data = param.data.to(offload_device)
+                    param.data = param.data.to(offload_device, non_blocking=transformer.use_non_blocking)
                 elif model["block_swap_args"]["offload_img_emb"] and "img_emb" in name:
-                    param.data = param.data.to(offload_device)
+                    param.data = param.data.to(offload_device, non_blocking=transformer.use_non_blocking)
 
             transformer.block_swap(
                 model["block_swap_args"]["blocks_to_swap"] - 1 ,
                 model["block_swap_args"]["offload_txt_emb"],
                 model["block_swap_args"]["offload_img_emb"],
             )
+
         elif model["auto_cpu_offload"]:
             for module in transformer.modules():
                 if hasattr(module, "offload"):
@@ -1648,7 +1660,7 @@ class WanVideoSampler:
 
         intermediate_device = device
 
-        # diff diff prep
+       # diff diff prep
         masks = None
         if samples is not None and mask is not None:
             mask = 1 - mask
@@ -1724,7 +1736,7 @@ class WanVideoSampler:
                             else:
                                 current_teacache = None
 
-                            ## NEW CODE - 3/17 - 10am
+                            ## START BLENDING CODE FOR WAN SMART BLEND ##
                             prompt_index = min(int(max(c) / section_size), num_prompts - 1)
 
                             # Check for blend parameters from WanSmartBlend
@@ -1771,8 +1783,7 @@ class WanVideoSampler:
                                     positive = text_embeds["prompt_embeds"][prompt_index]
                             else:
                                 positive = text_embeds["prompt_embeds"][prompt_index]
-
-                            ## NEW CODE - 3/17 - 10am
+                            ## END BLENDING CODE FOR WAN SMART BLEND ##
 
                             partial_img_emb = None
                             if source_image_cond is not None:
@@ -1819,8 +1830,7 @@ class WanVideoSampler:
                         else:
                             current_teacache = None
 
-                        # JUST ADDED
-                        # prompt_index = min(int(max(c) / section_size), num_prompts - 1)
+                        ## START BLENDING CODE FOR WAN SMART BLEND ##
                         prompt_index = min(int(max(c) / section_size), num_prompts - 1)
 
                         # Check for blend parameters from WanSmartBlend
@@ -1867,19 +1877,8 @@ class WanVideoSampler:
                                 positive = text_embeds["prompt_embeds"][prompt_index]
                         else:
                             positive = text_embeds["prompt_embeds"][prompt_index]
-
-                        # # Add verbosity support:
-                        # verbosity = text_embeds.get("verbosity", 0)
-                        # if verbosity > 1:
-                        #     # Calculate position within section (0-1)
-                        #     position = (max(c) % section_size) / section_size
-                        #     blend_zone = text_embeds.get("blend_width", 0) / section_size
-                            
-                        #     if position > (1.0 - blend_zone) and prompt_index < len(text_embeds["prompt_embeds"]) - 1:
-                        #         # We're in a transition zone
-                        #         raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
-                        #         next_index = prompt_index + 1
-                        #         log.info(f"Blending prompts {prompt_index}→{next_index} with ratio {raw_ratio:.3f}")
+                        
+                        ## END BLENDING CODE FOR WAN SMART BLEND ##
                         
                         partial_img_emb = None
                         if image_cond is not None:
@@ -1926,12 +1925,7 @@ class WanVideoSampler:
                     else:
                         current_teacache = None
 
-                    # prompt_index = min(int(max(c) / section_size), num_prompts - 1)
-
-                    ## NEW CODE - 3/17 - 10am
-                    prompt_index = min(int(max(c) / section_size), num_prompts - 1)
-                    if context_options["verbose"]:
-                        log.info(f"Prompt index: {prompt_index}")
+                    ## START BLENDING CODE FOR WAN SMART BLEND ##
                     
                     # Use the appropriate prompt for this section
                     # positive = text_embeds["prompt_embeds"][prompt_index]
@@ -1981,21 +1975,8 @@ class WanVideoSampler:
                             positive = text_embeds["prompt_embeds"][prompt_index]
                     else:
                         positive = text_embeds["prompt_embeds"][prompt_index]
-                    ## NEW CODE - 3/17 - 10am
 
-
-                    # # Add verbosity support:
-                    # verbosity = text_embeds.get("verbosity", 0)
-                    # if verbosity > 1:
-                    #     # Calculate position within section (0-1)
-                    #     position = (max(c) % section_size) / section_size
-                    #     blend_zone = text_embeds.get("blend_width", 0) / section_size
-                        
-                    #     if position > (1.0 - blend_zone) and prompt_index < len(text_embeds["prompt_embeds"]) - 1:
-                    #         # We're in a transition zone
-                    #         raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
-                    #         next_index = prompt_index + 1
-                    #         log.info(f"Blending prompts {prompt_index}→{next_index} with ratio {raw_ratio:.3f}")
+                    ## END BLENDING CODE FOR WAN SMART BLEND ##
 
                     partial_img_emb = None
                     if image_cond is not None:
@@ -2014,10 +1995,15 @@ class WanVideoSampler:
                                 if context_vae is not None:
                                     to_decode = self.previous_noise_pred_context[:,-1,:, :].unsqueeze(1).unsqueeze(0).to(context_vae.dtype)
                                     #to_decode = to_decode.permute(0, 1, 3, 2)
-                                    #print("to_decode.shape", to_decode.shape)
-                                    image = context_vae.decode(to_decode, device=device, tiled=False)[0]
+                                    print("to_decode.shape", to_decode.shape)
+                                    if isinstance(context_vae, TAEHV):
+                                        image = context_vae.decode_video(to_decode.permute(0, 2, 1, 3, 4), parallel=False)
+                                        print("image.shape", image.shape)
+                                        image = context_vae.encode_video(image.repeat(1, 5, 1, 1, 1), parallel=False).permute(0, 2, 1, 3, 4)
+                                    else:
+                                        image = context_vae.decode(to_decode, device=device, tiled=False)[0]
+                                        image = context_vae.encode(image.unsqueeze(0).to(context_vae.dtype), device=device, tiled=False)
                                     #print("decoded image.shape", image.shape) #torch.Size([3, 37, 832, 480])
-                                    image = context_vae.encode(image.unsqueeze(0).to(context_vae.dtype), device=device, tiled=False)
                                     #print("encoded image.shape", image.shape)
                                     #partial_img_emb[:, 0, :, :] = image[0][:,0,:,:]                                        
                                     #print("partial_img_emb.shape", partial_img_emb.shape)
@@ -2121,7 +2107,7 @@ class WanVideoSampler:
             pass
 
         return ({
-            "samples": x0.unsqueeze(0).cpu()
+            "samples": x0.unsqueeze(0).cpu(), "looped": is_looped
             }, )
     
 class WindowTracker:
@@ -2369,9 +2355,8 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoGranularTextEncode": WanVideoGranularTextEncode,
     "WanVideoSmartSampler": WanVideoSmartSampler,
     "WanVideoTinyVAELoader": WanVideoTinyVAELoader,
-    "WanVideoLoopArgs": WanVideoLoopArgs
+    "WanVideoLoopArgs": WanVideoLoopArgs,
 }
-
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
     "WanVideoDecode": "WanVideo Decode",
@@ -2400,5 +2385,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoGranularTextEncode": "WanVideo Granular TextEncode",
     "WanVideoSmartSampler": "WanVideo Smart Sampler",
     "WanVideoTinyVAELoader": "WanVideo Tiny VAE Loader",
-    "WanVideoLoopArgs": "WanVideo Loop Args"
+    "WanVideoLoopArgs": "WanVideo Loop Args",
 }
