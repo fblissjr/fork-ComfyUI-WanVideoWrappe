@@ -2,44 +2,6 @@ import numpy as np
 from typing import Callable, Optional, List
 
 
-# SAE
-def feature_aware_context_window(
-    feature_indices: List[int],
-    feature_values: List[float],
-    context_size: int = 81,
-    context_overlap: int = 16,
-    context_stride: int = 3,
-    closed_loop: bool = True,
-):
-    """Adjust context windowing parameters based on active Spectre features."""
-    
-    # Simple rules for feature-based window adjustments
-    for idx, value in zip(feature_indices, feature_values):
-        # Feature 345: Color names - increase overlap to maintain color consistency
-        if idx == 345 and value > 0.5:
-            context_overlap += 4
-            
-        # Feature 70: Standalone sentences - decrease overlap
-        if idx == 70 and value > 0.5:
-            context_overlap = max(8, context_overlap - 4)
-            
-        # Feature 95: Comparison/contrast - increase stride for smoother transitions
-        if idx == 95 and value > 0.5:
-            context_stride += 1
-            
-        # Feature 167: Letter 'L' prominence - no special treatment needed
-        
-        # Feature 2198: Driving/cars - increase overlap for motion consistency
-        if idx == 2198 and value > 0.5:
-            context_overlap += 8
-            
-        # Feature 596: Emotions - increase overlap for mood consistency
-        if idx == 596 and value > 0.5:
-            context_overlap += 6
-    
-    # Return modified context parameters
-    return context_size, context_overlap, context_stride, closed_loop
-
 def ordered_halving(val):
     bin_str = f"{val:064b}"
     bin_flip = bin_str[::-1]
