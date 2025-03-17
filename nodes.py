@@ -30,7 +30,6 @@ from .context import feature_aware_context_window
 
 from .granular_text_encode import WanVideoGranularTextEncode
 from .smart_context_sampler import WanVideoSmartSampler
-from .entity_tracker import EntityTracker
 
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
@@ -1643,61 +1642,6 @@ class WanVideoSampler:
                 zt_src = (1-sigma) * x_init + sigma * noise.to(t)
                 zt_tgt = x_tgt + zt_src - x_init
 
-                # prompt blend logic
-                # Patch for nodes.py in WanVideoWrapper
-                # Within WanVideoSampler, add this code in the prompt selection logic:
-                def apply_blend(prompt_index, c, section_size, text_embeds):
-                    """
-                    Apply blending between prompts at section boundaries with proper device handling.
-                    """
-                    # Check if blending is enabled
-                    blend_width = text_embeds.get("blend_width", 0)
-                    
-                    if blend_width > 0 and prompt_index < len(text_embeds["prompt_embeds"]) - 1:
-                        # Calculate position within section (0-1)
-                        position = (max(c) % section_size) / section_size
-                        # Calculate blend zone (as proportion of section)
-                        blend_zone = blend_width / section_size
-                        
-                        if position > (1.0 - blend_zone):
-                            # We're in the transition zone
-                            raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
-                            
-                            # Apply the selected curve
-                            blend_method = text_embeds.get("blend_method", "linear")
-                            
-                            # Get embeddings - preserve their original device and dtype
-                            current_embed = text_embeds["prompt_embeds"][prompt_index]
-                            next_embed = text_embeds["prompt_embeds"][prompt_index + 1]
-                            
-                            # Note device and dtype for consistency checking
-                            if verbosity > 2:
-                                print(f"Blending prompts {prompt_index}→{prompt_index+1}, " 
-                                    f"device: {current_embed.device}, dtype: {current_embed.dtype}")
-                            
-                            # Try to import from WanSeamlessFlow if available
-                            try:
-                                from WanSeamlessFlow.blending import blend_embeddings
-                                return blend_embeddings(current_embed, next_embed, raw_ratio, method=blend_method)
-                            except ImportError:
-                                # Fallback with device-aware blending
-                                if blend_method == "smooth":
-                                    blend_ratio = raw_ratio * raw_ratio * (3 - 2 * raw_ratio)
-                                elif blend_method == "ease_in":
-                                    blend_ratio = raw_ratio * raw_ratio
-                                elif blend_method == "ease_out":
-                                    blend_ratio = raw_ratio * (2 - raw_ratio)
-                                else:
-                                    blend_ratio = raw_ratio
-                                
-                                # Perform blending while preserving device and dtype
-                                original_dtype = current_embed.dtype
-                                result = current_embed * (1 - blend_ratio) + next_embed * blend_ratio
-                                return result.to(dtype=original_dtype)
-                    
-                    # Not in transition zone, return original embedding
-                    return text_embeds["prompt_embeds"][prompt_index]
-
                 #source
                 if idx < len(timesteps) - drift_steps:
                     if context_options is not None:
@@ -1712,60 +1656,55 @@ class WanVideoSampler:
                             else:
                                 current_teacache = None
 
-                            #prompt_index = min(int(max(c) / section_size), num_prompts - 1)
-                            #prompt_index = min(int(max(c) / section_size), num_prompts - 1)
+                            ## NEW CODE - 3/17 - 10am
                             prompt_index = min(int(max(c) / section_size), num_prompts - 1)
 
-                            # WanSeamlessFlow integration - seamless transitions
-                            if "blend_width" in text_embeds and text_embeds["blend_width"] > 0:
-                                blend_width = text_embeds["blend_width"]
-                                blend_method = text_embeds.get("blend_method", "linear")
-                                verbosity = text_embeds.get("verbosity", 0)
+                            # Check for blend parameters from WanSmartBlend
+                            blend_width = text_embeds.get("blend_width", 0)
+                            blend_method = text_embeds.get("blend_method", "linear")
+                            verbosity = text_embeds.get("verbosity", 0)
+
+                            if blend_width > 0 and prompt_index < len(text_embeds["prompt_embeds"]) - 1:
+                                # Calculate position within section (0-1)
+                                position = (max(c) % section_size) / section_size
+                                # Calculate blend zone (as proportion of section)
+                                blend_zone = blend_width / section_size
                                 
-                                # Only blend if we're not at the last prompt
-                                if prompt_index < len(text_embeds["prompt_embeds"]) - 1:
-                                    # Calculate position within section (0-1)
-                                    position = (max(c) % section_size) / section_size
-                                    # Calculate blend zone (as proportion of section)
-                                    blend_zone = blend_width / section_size
+                                if position > (1.0 - blend_zone):
+                                    # We're in the transition zone
+                                    raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
                                     
-                                    if position > (1.0 - blend_zone):
-                                        # We're in the transition zone
-                                        raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
-                                        
-                                        # Apply the selected curve
-                                        if blend_method == "smooth":
-                                            blend_ratio = raw_ratio * raw_ratio * (3 - 2 * raw_ratio)
-                                        elif blend_method == "ease_in":
-                                            blend_ratio = raw_ratio * raw_ratio
-                                        elif blend_method == "ease_out":
-                                            blend_ratio = raw_ratio * (2 - raw_ratio)
-                                        else:
-                                            blend_ratio = raw_ratio
-                                        
-                                        # Get embeddings
-                                        current_embed = text_embeds["prompt_embeds"][prompt_index]
-                                        next_embed = text_embeds["prompt_embeds"][prompt_index + 1]
-                                        
-                                        # simpler code that assumes shapes are compatible:
-                                        if current_embed.shape[0] != next_embed.shape[0]:
-                                            if verbosity > 0:
-                                                log.info(f"⚠️ Embeddings still have mismatched shapes after normalization: {current_embed.shape} vs {next_embed.shape}")
-                                            positive = text_embeds["prompt_embeds"][prompt_index]
-                                        else:
-                                            # Linear interpolation
-                                            positive = current_embed * (1 - blend_ratio) + next_embed * blend_ratio
+                                    # Apply the selected curve
+                                    if blend_method == "smooth":
+                                        blend_ratio = raw_ratio * raw_ratio * (3 - 2 * raw_ratio)
+                                    elif blend_method == "ease_in":
+                                        blend_ratio = raw_ratio * raw_ratio
+                                    elif blend_method == "ease_out":
+                                        blend_ratio = raw_ratio * (2 - raw_ratio)
                                     else:
+                                        blend_ratio = raw_ratio
+                                    
+                                    # Get embeddings
+                                    current_embed = text_embeds["prompt_embeds"][prompt_index]
+                                    next_embed = text_embeds["prompt_embeds"][prompt_index + 1]
+                                    
+                                    # Check for shape compatibility
+                                    if current_embed.shape == next_embed.shape:
+                                        if verbosity > 0 and context_options and context_options.get("verbose", False):
+                                            log.info(f"Blending prompts {prompt_index}→{prompt_index+1} with ratio {blend_ratio:.3f}")
+                                        
+                                        # Linear interpolation
+                                        positive = current_embed * (1 - blend_ratio) + next_embed * blend_ratio
+                                    else:
+                                        if verbosity > 0:
+                                            log.info(f"⚠️ Cannot blend prompts {prompt_index}→{prompt_index+1}: shape mismatch {current_embed.shape} vs {next_embed.shape}")
                                         positive = text_embeds["prompt_embeds"][prompt_index]
                                 else:
                                     positive = text_embeds["prompt_embeds"][prompt_index]
                             else:
                                 positive = text_embeds["prompt_embeds"][prompt_index]
-                            
-                            if context_options["verbose"]:
-                                log.info(f"Prompt index: {prompt_index}")
 
-                            positive = source_embeds["prompt_embeds"][prompt_index]
+                            ## NEW CODE - 3/17 - 10am
 
                             partial_img_emb = None
                             if source_image_cond is not None:
@@ -1812,84 +1751,67 @@ class WanVideoSampler:
                         else:
                             current_teacache = None
 
+                        # JUST ADDED
                         # prompt_index = min(int(max(c) / section_size), num_prompts - 1)
                         prompt_index = min(int(max(c) / section_size), num_prompts - 1)
 
-                        # WanSeamlessFlow integration - seamless transitions
-                        if "blend_width" in text_embeds and text_embeds["blend_width"] > 0:
-                            blend_width = text_embeds["blend_width"]
-                            blend_method = text_embeds.get("blend_method", "linear")
-                            verbosity = text_embeds.get("verbosity", 0)
+                        # Check for blend parameters from WanSmartBlend
+                        blend_width = text_embeds.get("blend_width", 0)
+                        blend_method = text_embeds.get("blend_method", "linear")
+                        verbosity = text_embeds.get("verbosity", 0)
+
+                        if blend_width > 0 and prompt_index < len(text_embeds["prompt_embeds"]) - 1:
+                            # Calculate position within section (0-1)
+                            position = (max(c) % section_size) / section_size
+                            # Calculate blend zone (as proportion of section)
+                            blend_zone = blend_width / section_size
                             
-                            # Only blend if we're not at the last prompt
-                            if prompt_index < len(text_embeds["prompt_embeds"]) - 1:
-                                # Calculate position within section (0-1)
-                                position = (max(c) % section_size) / section_size
-                                # Calculate blend zone (as proportion of section)
-                                blend_zone = blend_width / section_size
+                            if position > (1.0 - blend_zone):
+                                # We're in the transition zone
+                                raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
                                 
-                                if position > (1.0 - blend_zone):
-                                    # We're in the transition zone
-                                    raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
-                                    
-                                    # Get embeddings
-                                    current_embed = text_embeds["prompt_embeds"][prompt_index]
-                                    next_embed = text_embeds["prompt_embeds"][prompt_index + 1]
-                                    
-                                    # Try to use WanSeamlessFlow's blend_embeddings function
-                                    try:
-                                        # Import dynamically to handle cases where the module might not be available
-                                        from WanSeamlessFlow.blending import blend_embeddings
-                                        
-                                        # Use the full-featured blending function
-                                        positive = blend_embeddings(
-                                            current_embed, 
-                                            next_embed, 
-                                            raw_ratio, 
-                                            method=text_embeds.get("blend_method", "linear")
-                                        )
-                                        
-                                        if verbosity > 1:
-                                            print(f"✓ Blending prompts {prompt_index}→{prompt_index+1} with ratio {raw_ratio:.3f}")
-                                            
-                                    except (ImportError, Exception) as e:
-                                        # Fallback to simple blending with shape check
-                                        if current_embed.shape != next_embed.shape:
-                                            print(f"⚠️ Cannot blend prompts {prompt_index}→{prompt_index+1}: {str(e)}")
-                                            positive = text_embeds["prompt_embeds"][prompt_index]
-                                        else:
-                                            # Apply curve (simplified fallback)
-                                            blend_method = text_embeds.get("blend_method", "linear")
-                                            if blend_method == "smooth":
-                                                blend_ratio = raw_ratio * raw_ratio * (3 - 2 * raw_ratio)
-                                            else:
-                                                blend_ratio = raw_ratio
-                                                
-                                            positive = current_embed * (1 - blend_ratio) + next_embed * blend_ratio
+                                # Apply the selected curve
+                                if blend_method == "smooth":
+                                    blend_ratio = raw_ratio * raw_ratio * (3 - 2 * raw_ratio)
+                                elif blend_method == "ease_in":
+                                    blend_ratio = raw_ratio * raw_ratio
+                                elif blend_method == "ease_out":
+                                    blend_ratio = raw_ratio * (2 - raw_ratio)
                                 else:
+                                    blend_ratio = raw_ratio
+                                
+                                # Get embeddings
+                                current_embed = text_embeds["prompt_embeds"][prompt_index]
+                                next_embed = text_embeds["prompt_embeds"][prompt_index + 1]
+                                
+                                # Check for shape compatibility
+                                if current_embed.shape == next_embed.shape:
+                                    if verbosity > 0 and context_options and context_options.get("verbose", False):
+                                        log.info(f"Blending prompts {prompt_index}→{prompt_index+1} with ratio {blend_ratio:.3f}")
+                                    
+                                    # Linear interpolation
+                                    positive = current_embed * (1 - blend_ratio) + next_embed * blend_ratio
+                                else:
+                                    if verbosity > 0:
+                                        log.info(f"⚠️ Cannot blend prompts {prompt_index}→{prompt_index+1}: shape mismatch {current_embed.shape} vs {next_embed.shape}")
                                     positive = text_embeds["prompt_embeds"][prompt_index]
                             else:
                                 positive = text_embeds["prompt_embeds"][prompt_index]
                         else:
                             positive = text_embeds["prompt_embeds"][prompt_index]
-                        if context_options["verbose"]:
-                            log.info(f"Prompt index: {prompt_index}")
-                     
-                        # positive = text_embeds["prompt_embeds"][prompt_index]
-                        #positive = apply_blend(prompt_index, c, section_size, text_embeds)
 
-                        # Add verbosity support:
-                        verbosity = text_embeds.get("verbosity", 0)
-                        if verbosity > 1:
-                            # Calculate position within section (0-1)
-                            position = (max(c) % section_size) / section_size
-                            blend_zone = text_embeds.get("blend_width", 0) / section_size
+                        # # Add verbosity support:
+                        # verbosity = text_embeds.get("verbosity", 0)
+                        # if verbosity > 1:
+                        #     # Calculate position within section (0-1)
+                        #     position = (max(c) % section_size) / section_size
+                        #     blend_zone = text_embeds.get("blend_width", 0) / section_size
                             
-                            if position > (1.0 - blend_zone) and prompt_index < len(text_embeds["prompt_embeds"]) - 1:
-                                # We're in a transition zone
-                                raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
-                                next_index = prompt_index + 1
-                                log.info(f"Blending prompts {prompt_index}→{next_index} with ratio {raw_ratio:.3f}")
+                        #     if position > (1.0 - blend_zone) and prompt_index < len(text_embeds["prompt_embeds"]) - 1:
+                        #         # We're in a transition zone
+                        #         raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
+                        #         next_index = prompt_index + 1
+                        #         log.info(f"Blending prompts {prompt_index}→{next_index} with ratio {raw_ratio:.3f}")
                         
                         partial_img_emb = None
                         if image_cond is not None:
@@ -1936,14 +1858,63 @@ class WanVideoSampler:
                     else:
                         current_teacache = None
 
-                    # # prompt_index = min(int(max(c) / section_size), num_prompts - 1)
                     # prompt_index = min(int(max(c) / section_size), num_prompts - 1)
-                    # if context_options["verbose"]:
-                    #     log.info(f"Prompt index: {prompt_index}")
+
+                    ## NEW CODE - 3/17 - 10am
+                    prompt_index = min(int(max(c) / section_size), num_prompts - 1)
+                    if context_options["verbose"]:
+                        log.info(f"Prompt index: {prompt_index}")
                     
-                    # # Use the appropriate prompt for this section
-                    # # positive = text_embeds["prompt_embeds"][prompt_index]
-                    # # positive = apply_blend(prompt_index, c, section_size, text_embeds)
+                    # Use the appropriate prompt for this section
+                    # positive = text_embeds["prompt_embeds"][prompt_index]
+                    prompt_index = min(int(max(c) / section_size), num_prompts - 1)
+
+                    # Check for blend parameters from WanSmartBlend
+                    blend_width = text_embeds.get("blend_width", 0)
+                    blend_method = text_embeds.get("blend_method", "linear")
+                    verbosity = text_embeds.get("verbosity", 0)
+
+                    if blend_width > 0 and prompt_index < len(text_embeds["prompt_embeds"]) - 1:
+                        # Calculate position within section (0-1)
+                        position = (max(c) % section_size) / section_size
+                        # Calculate blend zone (as proportion of section)
+                        blend_zone = blend_width / section_size
+                        
+                        if position > (1.0 - blend_zone):
+                            # We're in the transition zone
+                            raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
+                            
+                            # Apply the selected curve
+                            if blend_method == "smooth":
+                                blend_ratio = raw_ratio * raw_ratio * (3 - 2 * raw_ratio)
+                            elif blend_method == "ease_in":
+                                blend_ratio = raw_ratio * raw_ratio
+                            elif blend_method == "ease_out":
+                                blend_ratio = raw_ratio * (2 - raw_ratio)
+                            else:
+                                blend_ratio = raw_ratio
+                            
+                            # Get embeddings
+                            current_embed = text_embeds["prompt_embeds"][prompt_index]
+                            next_embed = text_embeds["prompt_embeds"][prompt_index + 1]
+                            
+                            # Check for shape compatibility
+                            if current_embed.shape == next_embed.shape:
+                                if verbosity > 0 and context_options and context_options.get("verbose", False):
+                                    log.info(f"Blending prompts {prompt_index}→{prompt_index+1} with ratio {blend_ratio:.3f}")
+                                
+                                # Linear interpolation
+                                positive = current_embed * (1 - blend_ratio) + next_embed * blend_ratio
+                            else:
+                                if verbosity > 0:
+                                    log.info(f"⚠️ Cannot blend prompts {prompt_index}→{prompt_index+1}: shape mismatch {current_embed.shape} vs {next_embed.shape}")
+                                positive = text_embeds["prompt_embeds"][prompt_index]
+                        else:
+                            positive = text_embeds["prompt_embeds"][prompt_index]
+                    else:
+                        positive = text_embeds["prompt_embeds"][prompt_index]
+                    ## NEW CODE - 3/17 - 10am
+
 
                     # # Add verbosity support:
                     # verbosity = text_embeds.get("verbosity", 0)
@@ -1957,66 +1928,6 @@ class WanVideoSampler:
                     #         raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
                     #         next_index = prompt_index + 1
                     #         log.info(f"Blending prompts {prompt_index}→{next_index} with ratio {raw_ratio:.3f}")
-                    prompt_index = min(int(max(c) / section_size), num_prompts - 1)
-
-                    # WanSeamlessFlow integration - seamless transitions
-                    if "blend_width" in text_embeds and text_embeds["blend_width"] > 0:
-                        blend_width = text_embeds["blend_width"]
-                        blend_method = text_embeds.get("blend_method", "linear")
-                        verbosity = text_embeds.get("verbosity", 0)
-                        
-                        # Only blend if we're not at the last prompt
-                        if prompt_index < len(text_embeds["prompt_embeds"]) - 1:
-                            # Calculate position within section (0-1)
-                            position = (max(c) % section_size) / section_size
-                            # Calculate blend zone (as proportion of section)
-                            blend_zone = blend_width / section_size
-                            
-                            if position > (1.0 - blend_zone):
-                                # We're in the transition zone
-                                raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
-                                
-                                # Get embeddings
-                                current_embed = text_embeds["prompt_embeds"][prompt_index]
-                                next_embed = text_embeds["prompt_embeds"][prompt_index + 1]
-                                
-                                # Try to use WanSeamlessFlow's blend_embeddings function
-                                try:
-                                    # Import dynamically to handle cases where the module might not be available
-                                    from WanSeamlessFlow.blending import blend_embeddings
-                                    
-                                    # Use the full-featured blending function
-                                    positive = blend_embeddings(
-                                        current_embed, 
-                                        next_embed, 
-                                        raw_ratio, 
-                                        method=text_embeds.get("blend_method", "linear")
-                                    )
-                                    
-                                    if verbosity > 1:
-                                        print(f"✓ Blending prompts {prompt_index}→{prompt_index+1} with ratio {raw_ratio:.3f}")
-                                        
-                                except (ImportError, Exception) as e:
-                                    # Fallback to simple blending with shape check
-                                    if current_embed.shape != next_embed.shape:
-                                        print(f"⚠️ Cannot blend prompts {prompt_index}→{prompt_index+1}: {str(e)}")
-                                        positive = text_embeds["prompt_embeds"][prompt_index]
-                                    else:
-                                        # Apply curve (simplified fallback)
-                                        blend_method = text_embeds.get("blend_method", "linear")
-                                        if blend_method == "smooth":
-                                            blend_ratio = raw_ratio * raw_ratio * (3 - 2 * raw_ratio)
-                                        else:
-                                            blend_ratio = raw_ratio
-                                            
-                                        positive = current_embed * (1 - blend_ratio) + next_embed * blend_ratio
-                            else:
-                                positive = text_embeds["prompt_embeds"][prompt_index]
-                        else:
-                            positive = text_embeds["prompt_embeds"][prompt_index]
-                    else:
-                        positive = text_embeds["prompt_embeds"][prompt_index]
-
 
                     partial_img_emb = None
                     if image_cond is not None:
@@ -2150,7 +2061,7 @@ class WindowTracker:
         if key not in self.window_map:
             self.window_map[key] = self.next_id
             if self.verbose:
-                log.info(f"New window pattern {key} -> ID {self.next_id}")
+                log.debug(f"New window pattern {key} -> ID {self.next_id}")
             self.next_id += 1
         return self.window_map[key]
     
