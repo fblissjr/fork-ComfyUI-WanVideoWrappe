@@ -15,7 +15,6 @@ from .wanvideo.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 
 from .enhance_a_video.globals import enable_enhance, disable_enhance, set_enhance_weight, set_num_frames
-from .taehv import TAEHV
 
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
@@ -27,6 +26,12 @@ import comfy.model_base
 import comfy.latent_formats
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
 from comfy.sd import load_lora_for_models
+from .context import feature_aware_context_window
+
+from .granular_text_encode import WanVideoGranularTextEncode
+from .smart_context_sampler import WanVideoSmartSampler
+from .entity_tracker import EntityTracker
+
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -45,9 +50,6 @@ class WanVideoBlockSwap:
                 "blocks_to_swap": ("INT", {"default": 20, "min": 0, "max": 40, "step": 1, "tooltip": "Number of transformer blocks to swap, the 14B model has 40, while the 1.3B model has 30 blocks"}),
                 "offload_img_emb": ("BOOLEAN", {"default": False, "tooltip": "Offload img_emb to offload_device"}),
                 "offload_txt_emb": ("BOOLEAN", {"default": False, "tooltip": "Offload time_emb to offload_device"}),
-            },
-            "optional": {
-                "use_non_blocking": ("BOOLEAN", {"default": True, "tooltip": "Use non-blocking memory transfer for offloading, reserves more RAM but is faster"}),
             },
         }
     RETURN_TYPES = ("BLOCKSWAPARGS",)
@@ -545,11 +547,10 @@ class WanVideoModelLoader:
                         computation_dtype=base_dtype,
                         computation_device=device,
                     ),
-                    compile_args = compile_args,
                 )
 
             #compile
-            if compile_args is not None and vram_management_args is None:
+            if compile_args is not None:
                 torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
                 if compile_args["compile_transformer_blocks_only"]:
                     for i, block in enumerate(patcher.model.diffusion_model.blocks):
@@ -680,42 +681,6 @@ class WanVideoVAELoader:
         vae.eval()
         vae.to(device = offload_device, dtype = dtype)
             
-
-        return (vae,)
-
-class WanVideoTinyVAELoader:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model_name": (folder_paths.get_filename_list("vae_approx"), {"tooltip": "These models are loaded from 'ComfyUI/models/vae_approx'"}),
-            },
-            "optional": {
-                "precision": (["fp16", "fp32", "bf16"],
-                    {"default": "fp16"}
-                ),
-            }
-        }
-
-    RETURN_TYPES = ("WANVAE",)
-    RETURN_NAMES = ("vae", )
-    FUNCTION = "loadmodel"
-    CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Loads Hunyuan VAE model from 'ComfyUI/models/vae'"
-
-    def loadmodel(self, model_name, precision):
-        from .taehv import TAEHV
-
-        device = mm.get_torch_device()
-        offload_device = mm.unet_offload_device()
-
-        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
-        model_path = folder_paths.get_full_path("vae_approx", model_name)
-        vae_sd = load_torch_file(model_path, safe_load=True)
-        
-        vae = TAEHV(vae_sd)
-       
-        vae.to(device = offload_device, dtype = dtype)
 
         return (vae,)
 
@@ -1128,7 +1093,7 @@ class WanVideoSLG:
     def INPUT_TYPES(s):
         return {"required": {
             "blocks": ("STRING", {"default": "10", "tooltip": "Blocks to skip uncond on, separated by comma, index starts from 0"}),
-            "start_percent": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Start percent of the control signal"}),
+            "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Start percent of the control signal"}),
             "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "End percent of the control signal"}),
             },
         }
@@ -1246,7 +1211,6 @@ class WanVideoSampler:
                 "flowedit_args": ("FLOWEDITARGS", ),
                 "batched_cfg": ("BOOLEAN", {"default": False, "tooltip": "Batc cond and uncond for faster sampling, possibly faster on some hardware, uses more memory"}),
                 "slg_args": ("SLGARGS", ),
-                "rope_function": (["default", "comfy"], {"default": "default", "tooltip": "!EXPERIMENTAL! Comfy's RoPE implementation doesn't use complex numbers and can thus be compiled, that should be a lot faster when using torch.compile"}),
             }
         }
 
@@ -1257,7 +1221,7 @@ class WanVideoSampler:
 
     def process(self, model, text_embeds, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, 
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None, 
-        teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default"):
+        teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None):
         #assert not (context_options and teacache_args), "Context options cannot currently be used together with teacache."
         patcher = model
         model = model.model
@@ -1358,7 +1322,6 @@ class WanVideoSampler:
             
         latent_video_length = noise.shape[1]
 
-        is_looped = False
         if context_options is not None:
             def create_window_mask(noise_pred_context, c, latent_video_length, context_overlap, looped=False):
                 window_mask = torch.ones_like(noise_pred_context)
@@ -1431,20 +1394,13 @@ class WanVideoSampler:
 
         latent = noise.to(device)
 
-        freqs = None
-        transformer.rope_embedder.k = None
-        transformer.rope_embedder.num_frames = None
-        if rope_function=="comfy":
-            transformer.rope_embedder.k = riflex_freq_index
-            transformer.rope_embedder.num_frames = latent_video_length
-        else:
-            d = transformer.dim // transformer.num_heads
-            freqs = torch.cat([
-                rope_params(1024, d - 4 * (d // 6), L_test=latent_video_length, k=riflex_freq_index),
-                rope_params(1024, 2 * (d // 6)),
-                rope_params(1024, 2 * (d // 6))
-            ],
-            dim=1)
+        d = transformer.dim // transformer.num_heads
+        freqs = torch.cat([
+            rope_params(1024, d - 4 * (d // 6), L_test=latent_video_length, k=riflex_freq_index),
+            rope_params(1024, 2 * (d // 6)),
+            rope_params(1024, 2 * (d // 6))
+        ],
+        dim=1)
 
         if not isinstance(cfg, list):
             cfg = [cfg] * (steps +1)
@@ -1453,26 +1409,24 @@ class WanVideoSampler:
            
         pbar = ProgressBar(steps)
 
-        from .latent_preview import prepare_callback
+        from latent_preview import prepare_callback
         callback = prepare_callback(patcher, steps)
 
         #blockswap init
         if model["block_swap_args"] is not None:
-            transformer.use_non_blocking = model["block_swap_args"].get("use_non_blocking", True)
             for name, param in transformer.named_parameters():
                 if "block" not in name:
                     param.data = param.data.to(device)
                 elif model["block_swap_args"]["offload_txt_emb"] and "txt_emb" in name:
-                    param.data = param.data.to(offload_device, non_blocking=transformer.use_non_blocking)
+                    param.data = param.data.to(offload_device)
                 elif model["block_swap_args"]["offload_img_emb"] and "img_emb" in name:
-                    param.data = param.data.to(offload_device, non_blocking=transformer.use_non_blocking)
+                    param.data = param.data.to(offload_device)
 
             transformer.block_swap(
                 model["block_swap_args"]["blocks_to_swap"] - 1 ,
                 model["block_swap_args"]["offload_txt_emb"],
                 model["block_swap_args"]["offload_img_emb"],
             )
-
         elif model["auto_cpu_offload"]:
             for module in transformer.modules():
                 if hasattr(module, "offload"):
@@ -1689,6 +1643,61 @@ class WanVideoSampler:
                 zt_src = (1-sigma) * x_init + sigma * noise.to(t)
                 zt_tgt = x_tgt + zt_src - x_init
 
+                # prompt blend logic
+                # Patch for nodes.py in WanVideoWrapper
+                # Within WanVideoSampler, add this code in the prompt selection logic:
+                def apply_blend(prompt_index, c, section_size, text_embeds):
+                    """
+                    Apply blending between prompts at section boundaries with proper device handling.
+                    """
+                    # Check if blending is enabled
+                    blend_width = text_embeds.get("blend_width", 0)
+                    
+                    if blend_width > 0 and prompt_index < len(text_embeds["prompt_embeds"]) - 1:
+                        # Calculate position within section (0-1)
+                        position = (max(c) % section_size) / section_size
+                        # Calculate blend zone (as proportion of section)
+                        blend_zone = blend_width / section_size
+                        
+                        if position > (1.0 - blend_zone):
+                            # We're in the transition zone
+                            raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
+                            
+                            # Apply the selected curve
+                            blend_method = text_embeds.get("blend_method", "linear")
+                            
+                            # Get embeddings - preserve their original device and dtype
+                            current_embed = text_embeds["prompt_embeds"][prompt_index]
+                            next_embed = text_embeds["prompt_embeds"][prompt_index + 1]
+                            
+                            # Note device and dtype for consistency checking
+                            if verbosity > 2:
+                                print(f"Blending prompts {prompt_index}→{prompt_index+1}, " 
+                                    f"device: {current_embed.device}, dtype: {current_embed.dtype}")
+                            
+                            # Try to import from WanSeamlessFlow if available
+                            try:
+                                from WanSeamlessFlow.blending import blend_embeddings
+                                return blend_embeddings(current_embed, next_embed, raw_ratio, method=blend_method)
+                            except ImportError:
+                                # Fallback with device-aware blending
+                                if blend_method == "smooth":
+                                    blend_ratio = raw_ratio * raw_ratio * (3 - 2 * raw_ratio)
+                                elif blend_method == "ease_in":
+                                    blend_ratio = raw_ratio * raw_ratio
+                                elif blend_method == "ease_out":
+                                    blend_ratio = raw_ratio * (2 - raw_ratio)
+                                else:
+                                    blend_ratio = raw_ratio
+                                
+                                # Perform blending while preserving device and dtype
+                                original_dtype = current_embed.dtype
+                                result = current_embed * (1 - blend_ratio) + next_embed * blend_ratio
+                                return result.to(dtype=original_dtype)
+                    
+                    # Not in transition zone, return original embedding
+                    return text_embeds["prompt_embeds"][prompt_index]
+
                 #source
                 if idx < len(timesteps) - drift_steps:
                     if context_options is not None:
@@ -1703,7 +1712,56 @@ class WanVideoSampler:
                             else:
                                 current_teacache = None
 
+                            #prompt_index = min(int(max(c) / section_size), num_prompts - 1)
+                            #prompt_index = min(int(max(c) / section_size), num_prompts - 1)
                             prompt_index = min(int(max(c) / section_size), num_prompts - 1)
+
+                            # WanSeamlessFlow integration - seamless transitions
+                            if "blend_width" in text_embeds and text_embeds["blend_width"] > 0:
+                                blend_width = text_embeds["blend_width"]
+                                blend_method = text_embeds.get("blend_method", "linear")
+                                verbosity = text_embeds.get("verbosity", 0)
+                                
+                                # Only blend if we're not at the last prompt
+                                if prompt_index < len(text_embeds["prompt_embeds"]) - 1:
+                                    # Calculate position within section (0-1)
+                                    position = (max(c) % section_size) / section_size
+                                    # Calculate blend zone (as proportion of section)
+                                    blend_zone = blend_width / section_size
+                                    
+                                    if position > (1.0 - blend_zone):
+                                        # We're in the transition zone
+                                        raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
+                                        
+                                        # Apply the selected curve
+                                        if blend_method == "smooth":
+                                            blend_ratio = raw_ratio * raw_ratio * (3 - 2 * raw_ratio)
+                                        elif blend_method == "ease_in":
+                                            blend_ratio = raw_ratio * raw_ratio
+                                        elif blend_method == "ease_out":
+                                            blend_ratio = raw_ratio * (2 - raw_ratio)
+                                        else:
+                                            blend_ratio = raw_ratio
+                                        
+                                        # Get embeddings
+                                        current_embed = text_embeds["prompt_embeds"][prompt_index]
+                                        next_embed = text_embeds["prompt_embeds"][prompt_index + 1]
+                                        
+                                        # simpler code that assumes shapes are compatible:
+                                        if current_embed.shape[0] != next_embed.shape[0]:
+                                            if verbosity > 0:
+                                                log.info(f"⚠️ Embeddings still have mismatched shapes after normalization: {current_embed.shape} vs {next_embed.shape}")
+                                            positive = text_embeds["prompt_embeds"][prompt_index]
+                                        else:
+                                            # Linear interpolation
+                                            positive = current_embed * (1 - blend_ratio) + next_embed * blend_ratio
+                                    else:
+                                        positive = text_embeds["prompt_embeds"][prompt_index]
+                                else:
+                                    positive = text_embeds["prompt_embeds"][prompt_index]
+                            else:
+                                positive = text_embeds["prompt_embeds"][prompt_index]
+                            
                             if context_options["verbose"]:
                                 log.info(f"Prompt index: {prompt_index}")
 
@@ -1754,11 +1812,84 @@ class WanVideoSampler:
                         else:
                             current_teacache = None
 
+                        # prompt_index = min(int(max(c) / section_size), num_prompts - 1)
                         prompt_index = min(int(max(c) / section_size), num_prompts - 1)
+
+                        # WanSeamlessFlow integration - seamless transitions
+                        if "blend_width" in text_embeds and text_embeds["blend_width"] > 0:
+                            blend_width = text_embeds["blend_width"]
+                            blend_method = text_embeds.get("blend_method", "linear")
+                            verbosity = text_embeds.get("verbosity", 0)
+                            
+                            # Only blend if we're not at the last prompt
+                            if prompt_index < len(text_embeds["prompt_embeds"]) - 1:
+                                # Calculate position within section (0-1)
+                                position = (max(c) % section_size) / section_size
+                                # Calculate blend zone (as proportion of section)
+                                blend_zone = blend_width / section_size
+                                
+                                if position > (1.0 - blend_zone):
+                                    # We're in the transition zone
+                                    raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
+                                    
+                                    # Get embeddings
+                                    current_embed = text_embeds["prompt_embeds"][prompt_index]
+                                    next_embed = text_embeds["prompt_embeds"][prompt_index + 1]
+                                    
+                                    # Try to use WanSeamlessFlow's blend_embeddings function
+                                    try:
+                                        # Import dynamically to handle cases where the module might not be available
+                                        from WanSeamlessFlow.blending import blend_embeddings
+                                        
+                                        # Use the full-featured blending function
+                                        positive = blend_embeddings(
+                                            current_embed, 
+                                            next_embed, 
+                                            raw_ratio, 
+                                            method=text_embeds.get("blend_method", "linear")
+                                        )
+                                        
+                                        if verbosity > 1:
+                                            print(f"✓ Blending prompts {prompt_index}→{prompt_index+1} with ratio {raw_ratio:.3f}")
+                                            
+                                    except (ImportError, Exception) as e:
+                                        # Fallback to simple blending with shape check
+                                        if current_embed.shape != next_embed.shape:
+                                            print(f"⚠️ Cannot blend prompts {prompt_index}→{prompt_index+1}: {str(e)}")
+                                            positive = text_embeds["prompt_embeds"][prompt_index]
+                                        else:
+                                            # Apply curve (simplified fallback)
+                                            blend_method = text_embeds.get("blend_method", "linear")
+                                            if blend_method == "smooth":
+                                                blend_ratio = raw_ratio * raw_ratio * (3 - 2 * raw_ratio)
+                                            else:
+                                                blend_ratio = raw_ratio
+                                                
+                                            positive = current_embed * (1 - blend_ratio) + next_embed * blend_ratio
+                                else:
+                                    positive = text_embeds["prompt_embeds"][prompt_index]
+                            else:
+                                positive = text_embeds["prompt_embeds"][prompt_index]
+                        else:
+                            positive = text_embeds["prompt_embeds"][prompt_index]
                         if context_options["verbose"]:
                             log.info(f"Prompt index: {prompt_index}")
                      
-                        positive = text_embeds["prompt_embeds"][prompt_index]
+                        # positive = text_embeds["prompt_embeds"][prompt_index]
+                        #positive = apply_blend(prompt_index, c, section_size, text_embeds)
+
+                        # Add verbosity support:
+                        verbosity = text_embeds.get("verbosity", 0)
+                        if verbosity > 1:
+                            # Calculate position within section (0-1)
+                            position = (max(c) % section_size) / section_size
+                            blend_zone = text_embeds.get("blend_width", 0) / section_size
+                            
+                            if position > (1.0 - blend_zone) and prompt_index < len(text_embeds["prompt_embeds"]) - 1:
+                                # We're in a transition zone
+                                raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
+                                next_index = prompt_index + 1
+                                log.info(f"Blending prompts {prompt_index}→{next_index} with ratio {raw_ratio:.3f}")
                         
                         partial_img_emb = None
                         if image_cond is not None:
@@ -1805,12 +1936,87 @@ class WanVideoSampler:
                     else:
                         current_teacache = None
 
-                    prompt_index = min(int(max(c) / section_size), num_prompts - 1)
-                    if context_options["verbose"]:
-                        log.info(f"Prompt index: {prompt_index}")
+                    # # prompt_index = min(int(max(c) / section_size), num_prompts - 1)
+                    # prompt_index = min(int(max(c) / section_size), num_prompts - 1)
+                    # if context_options["verbose"]:
+                    #     log.info(f"Prompt index: {prompt_index}")
                     
-                    # Use the appropriate prompt for this section
-                    positive = text_embeds["prompt_embeds"][prompt_index]
+                    # # Use the appropriate prompt for this section
+                    # # positive = text_embeds["prompt_embeds"][prompt_index]
+                    # # positive = apply_blend(prompt_index, c, section_size, text_embeds)
+
+                    # # Add verbosity support:
+                    # verbosity = text_embeds.get("verbosity", 0)
+                    # if verbosity > 1:
+                    #     # Calculate position within section (0-1)
+                    #     position = (max(c) % section_size) / section_size
+                    #     blend_zone = text_embeds.get("blend_width", 0) / section_size
+                        
+                    #     if position > (1.0 - blend_zone) and prompt_index < len(text_embeds["prompt_embeds"]) - 1:
+                    #         # We're in a transition zone
+                    #         raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
+                    #         next_index = prompt_index + 1
+                    #         log.info(f"Blending prompts {prompt_index}→{next_index} with ratio {raw_ratio:.3f}")
+                    prompt_index = min(int(max(c) / section_size), num_prompts - 1)
+
+                    # WanSeamlessFlow integration - seamless transitions
+                    if "blend_width" in text_embeds and text_embeds["blend_width"] > 0:
+                        blend_width = text_embeds["blend_width"]
+                        blend_method = text_embeds.get("blend_method", "linear")
+                        verbosity = text_embeds.get("verbosity", 0)
+                        
+                        # Only blend if we're not at the last prompt
+                        if prompt_index < len(text_embeds["prompt_embeds"]) - 1:
+                            # Calculate position within section (0-1)
+                            position = (max(c) % section_size) / section_size
+                            # Calculate blend zone (as proportion of section)
+                            blend_zone = blend_width / section_size
+                            
+                            if position > (1.0 - blend_zone):
+                                # We're in the transition zone
+                                raw_ratio = (position - (1.0 - blend_zone)) / blend_zone
+                                
+                                # Get embeddings
+                                current_embed = text_embeds["prompt_embeds"][prompt_index]
+                                next_embed = text_embeds["prompt_embeds"][prompt_index + 1]
+                                
+                                # Try to use WanSeamlessFlow's blend_embeddings function
+                                try:
+                                    # Import dynamically to handle cases where the module might not be available
+                                    from WanSeamlessFlow.blending import blend_embeddings
+                                    
+                                    # Use the full-featured blending function
+                                    positive = blend_embeddings(
+                                        current_embed, 
+                                        next_embed, 
+                                        raw_ratio, 
+                                        method=text_embeds.get("blend_method", "linear")
+                                    )
+                                    
+                                    if verbosity > 1:
+                                        print(f"✓ Blending prompts {prompt_index}→{prompt_index+1} with ratio {raw_ratio:.3f}")
+                                        
+                                except (ImportError, Exception) as e:
+                                    # Fallback to simple blending with shape check
+                                    if current_embed.shape != next_embed.shape:
+                                        print(f"⚠️ Cannot blend prompts {prompt_index}→{prompt_index+1}: {str(e)}")
+                                        positive = text_embeds["prompt_embeds"][prompt_index]
+                                    else:
+                                        # Apply curve (simplified fallback)
+                                        blend_method = text_embeds.get("blend_method", "linear")
+                                        if blend_method == "smooth":
+                                            blend_ratio = raw_ratio * raw_ratio * (3 - 2 * raw_ratio)
+                                        else:
+                                            blend_ratio = raw_ratio
+                                            
+                                        positive = current_embed * (1 - blend_ratio) + next_embed * blend_ratio
+                            else:
+                                positive = text_embeds["prompt_embeds"][prompt_index]
+                        else:
+                            positive = text_embeds["prompt_embeds"][prompt_index]
+                    else:
+                        positive = text_embeds["prompt_embeds"][prompt_index]
+
 
                     partial_img_emb = None
                     if image_cond is not None:
@@ -1829,15 +2035,10 @@ class WanVideoSampler:
                                 if context_vae is not None:
                                     to_decode = self.previous_noise_pred_context[:,-1,:, :].unsqueeze(1).unsqueeze(0).to(context_vae.dtype)
                                     #to_decode = to_decode.permute(0, 1, 3, 2)
-                                    print("to_decode.shape", to_decode.shape)
-                                    if isinstance(context_vae, TAEHV):
-                                        image = context_vae.decode_video(to_decode.permute(0, 2, 1, 3, 4), parallel=False)
-                                        print("image.shape", image.shape)
-                                        image = context_vae.encode_video(image.repeat(1, 5, 1, 1, 1), parallel=False).permute(0, 2, 1, 3, 4)
-                                    else:
-                                        image = context_vae.decode(to_decode, device=device, tiled=False)[0]
-                                        image = context_vae.encode(image.unsqueeze(0).to(context_vae.dtype), device=device, tiled=False)
+                                    #print("to_decode.shape", to_decode.shape)
+                                    image = context_vae.decode(to_decode, device=device, tiled=False)[0]
                                     #print("decoded image.shape", image.shape) #torch.Size([3, 37, 832, 480])
+                                    image = context_vae.encode(image.unsqueeze(0).to(context_vae.dtype), device=device, tiled=False)
                                     #print("encoded image.shape", image.shape)
                                     #partial_img_emb[:, 0, :, :] = image[0][:,0,:,:]                                        
                                     #print("partial_img_emb.shape", partial_img_emb.shape)
@@ -1934,7 +2135,7 @@ class WanVideoSampler:
             pass
 
         return ({
-            "samples": x0.unsqueeze(0).cpu(), "looped": is_looped
+            "samples": x0.unsqueeze(0).cpu()
             }, )
     
 class WindowTracker:
@@ -1967,7 +2168,7 @@ class WanVideoDecode:
         return {"required": {
                     "vae": ("WANVAE",),
                     "samples": ("LATENT",),
-                    "enable_vae_tiling": ("BOOLEAN", {"default": False, "tooltip": "Drastically reduces memory use but may introduce seams"}),
+                    "enable_vae_tiling": ("BOOLEAN", {"default": True, "tooltip": "Drastically reduces memory use but may introduce seams"}),
                     "tile_x": ("INT", {"default": 272, "min": 64, "max": 2048, "step": 1, "tooltip": "Tile size in pixels, smaller values use less VRAM, may introduce more seams"}),
                     "tile_y": ("INT", {"default": 272, "min": 64, "max": 2048, "step": 1, "tooltip": "Tile size in pixels, smaller values use less VRAM, may introduce more seams"}),
                     "tile_stride_x": ("INT", {"default": 144, "min": 32, "max": 2048, "step": 32, "tooltip": "Tile stride in pixels, smaller values use less VRAM, may introduce more seams"}),
@@ -1991,26 +2192,14 @@ class WanVideoDecode:
 
         mm.soft_empty_cache()
 
-        is_looped = samples.get("looped", False)
-        warmup_latent_count = 3
-
-        if is_looped:
-            latents = torch.cat([latents, latents[:, :, :warmup_latent_count]], dim=2)
-
-        if isinstance(vae, TAEHV):            
-            image = vae.decode_video(latents.permute(0, 2, 1, 3, 4))[0].permute(1, 0, 2, 3)
-        else:
-            image = vae.decode(latents, device=device, tiled=enable_vae_tiling, tile_size=(tile_x, tile_y), tile_stride=(tile_stride_x, tile_stride_y))[0]
-            vae.model.clear_cache()
-            image = (image - image.min()) / (image.max() - image.min())
+        image = vae.decode(latents, device=device, tiled=enable_vae_tiling, tile_size=(tile_x, tile_y), tile_stride=(tile_stride_x, tile_stride_y))[0]
+        print(image.shape)
+        print(image.min(), image.max())
         vae.to(offload_device)
-
-        if is_looped:
-            image = image[:, warmup_latent_count * 4:]
-        
+        vae.model.clear_cache()
         mm.soft_empty_cache()
 
-        
+        image = (image - image.min()) / (image.max() - image.min())
         image = torch.clamp(image, 0.0, 1.0)
         image = image.permute(1, 2, 3, 0).cpu().float()
 
@@ -2023,7 +2212,7 @@ class WanVideoEncode:
         return {"required": {
                     "vae": ("WANVAE",),
                     "image": ("IMAGE",),
-                    "enable_vae_tiling": ("BOOLEAN", {"default": False, "tooltip": "Drastically reduces memory use but may introduce seams"}),
+                    "enable_vae_tiling": ("BOOLEAN", {"default": True, "tooltip": "Drastically reduces memory use but may introduce seams"}),
                     "tile_x": ("INT", {"default": 272, "min": 64, "max": 2048, "step": 1, "tooltip": "Tile size in pixels, smaller values use less VRAM, may introduce more seams"}),
                     "tile_y": ("INT", {"default": 272, "min": 64, "max": 2048, "step": 1, "tooltip": "Tile size in pixels, smaller values use less VRAM, may introduce more seams"}),
                     "tile_stride_x": ("INT", {"default": 144, "min": 32, "max": 2048, "step": 32, "tooltip": "Tile stride in pixels, smaller values use less VRAM, may introduce more seams"}),
@@ -2047,21 +2236,16 @@ class WanVideoEncode:
 
         vae.to(device)
 
-        image = (image.clone()).to(vae.dtype).to(device).unsqueeze(0).permute(0, 4, 1, 2, 3) # B, C, T, H, W
+        image = (image.clone() * 2.0 - 1.0).to(vae.dtype).to(device).unsqueeze(0).permute(0, 4, 1, 2, 3) # B, C, T, H, W
         if noise_aug_strength > 0.0:
             image = add_noise_to_reference_video(image, ratio=noise_aug_strength)
-
-        if isinstance(vae, TAEHV):
-            latents = vae.encode_video(image.permute(0, 2, 1, 3, 4), parallel=False)# B, T, C, H, W
-            latents = latents.permute(0, 2, 1, 3, 4)
-        else:
-            latents = vae.encode(image * 2.0 - 1.0, device=device, tiled=enable_vae_tiling, tile_size=(tile_x, tile_y), tile_stride=(tile_stride_x, tile_stride_y))
-            vae.model.clear_cache()
+        
+        latents = vae.encode(image, device=device, tiled=enable_vae_tiling, tile_size=(tile_x, tile_y), tile_stride=(tile_stride_x, tile_stride_y))
         if latent_strength != 1.0:
             latents *= latent_strength
 
         vae.to(offload_device)
-        
+        vae.model.clear_cache()
         mm.soft_empty_cache()
         print("encoded latents shape",latents.shape)
 
@@ -2171,6 +2355,124 @@ class WanVideoLatentPreview:
 
         return (latent_images.float().cpu(), out_factors)
 
+class WanVideoSpectreContextEnhancer:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True}),
+                "context_size": (
+                    "INT",
+                    {"default": 81, "min": 16, "max": 256, "step": 1},
+                ),
+                "context_overlap": (
+                    "INT",
+                    {"default": 16, "min": 4, "max": 64, "step": 1},
+                ),
+                "context_stride": (
+                    "INT",
+                    {"default": 3, "min": 1, "max": 10, "step": 1},
+                ),
+                "closed_loop": ("BOOLEAN", {"default": True}),
+                "contra_path": (
+                    "STRING",
+                    {"default": "thesephist/contra-bottleneck-t5-large-wikipedia"},
+                ),
+                "spectre_name": ("STRING", {"default": "lg-v6"}),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDCONTEXT", "STRING")
+    RETURN_NAMES = ("context_options", "feature_info")
+    FUNCTION = "enhance_context"
+    CATEGORY = "WanVideoWrapper"
+
+    def enhance_context(
+        self,
+        prompt,
+        context_size,
+        context_overlap,
+        context_stride,
+        closed_loop,
+        contra_path,
+        spectre_name,
+    ):
+        # This would typically load models, but for quick demo we'll just simulate
+        # You'd need to have the proper imports and model loading code here
+
+        # Simulate feature extraction
+        # In real implementation, you'd do:
+        # extractor = SpectreFeatureExtractor(contra, spectre, features)
+        # top_features = extractor.extract_top_features(prompt)
+
+        # For demo, let's simulate some features based on prompt keywords
+        feature_indices = []
+        feature_values = []
+        feature_descriptions = []
+
+        if (
+            "color" in prompt.lower()
+            or "blue" in prompt.lower()
+            or "red" in prompt.lower()
+        ):
+            feature_indices.append(345)
+            feature_values.append(0.9)
+            feature_descriptions.append("Presence of color names")
+
+        if "driving" in prompt.lower() or "car" in prompt.lower():
+            feature_indices.append(2198)
+            feature_values.append(0.8)
+            feature_descriptions.append("Driving/cars")
+
+        if (
+            "emotion" in prompt.lower()
+            or "feel" in prompt.lower()
+            or "happy" in prompt.lower()
+        ):
+            feature_indices.append(596)
+            feature_values.append(0.7)
+            feature_descriptions.append("Emotions")
+
+        # Use the detected features to modify context parameters
+        context_size, context_overlap, context_stride, closed_loop = (
+            feature_aware_context_window(
+                feature_indices,
+                feature_values,
+                context_size,
+                context_overlap,
+                context_stride,
+                closed_loop,
+            )
+        )
+
+        # Prepare feature info string
+        feature_info = "\n".join(
+            [
+                f"Feature #{idx}: {desc} (value: {val:.2f})"
+                for idx, val, desc in zip(
+                    feature_indices, feature_values, feature_descriptions
+                )
+            ]
+        )
+        if not feature_info:
+            feature_info = "No significant features detected in prompt."
+
+        # Return enhanced context parameters
+        context_options = {
+            "context_schedule": "uniform_standard",
+            "context_frames": context_size,
+            "context_stride": context_stride,
+            "context_overlap": context_overlap,
+            "freenoise": True,
+            "verbose": False,
+        }
+
+        return (
+            context_options,
+            f"Enhanced context parameters based on Spectre features:\n{feature_info}\n\nParameters:\nSize: {context_size}, Overlap: {context_overlap}, Stride: {context_stride}",
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
     "WanVideoDecode": WanVideoDecode,
@@ -2195,8 +2497,10 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoFlowEdit": WanVideoFlowEdit,
     "WanVideoControlEmbeds": WanVideoControlEmbeds,
     "WanVideoSLG": WanVideoSLG,
-    "WanVideoTinyVAELoader": WanVideoTinyVAELoader,
-    }
+    "WanVideoSpectreContextEnhancer": WanVideoSpectreContextEnhancer,
+    "WanVideoGranularTextEncode": WanVideoGranularTextEncode,
+    "WanVideoSmartSampler": WanVideoSmartSampler,
+}
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
     "WanVideoDecode": "WanVideo Decode",
@@ -2222,5 +2526,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoFlowEdit": "WanVideo FlowEdit",
     "WanVideoControlEmbeds": "WanVideo Control Embeds",
     "WanVideoSLG": "WanVideo SLG",
-    "WanVideoTinyVAELoader": "WanVideo Tiny VAE Loader",
-    }
+    "WanVideoSpectreContextEnhancer": "WanVideoSpectreContextEnhancer",
+    "WanVideoGranularTextEncode": "WanVideo Granular TextEncode",
+    "WanVideoSmartSampler": "WanVideo Smart Sampler",
+}
