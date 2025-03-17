@@ -656,7 +656,7 @@ class WanVideoVAELoader:
     RETURN_NAMES = ("vae", )
     FUNCTION = "loadmodel"
     CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Loads Hunyuan VAE model from 'ComfyUI/models/vae'"
+    DESCRIPTION = "Loads Wan VAE model from 'ComfyUI/models/vae'"
 
     def loadmodel(self, model_name, precision):
         from .wanvideo.wan_video_vae import WanVideoVAE
@@ -739,7 +739,7 @@ class LoadWanVideoT5TextEncoder:
     RETURN_NAMES = ("wan_t5_model", )
     FUNCTION = "loadmodel"
     CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Loads Hunyuan text_encoder model from 'ComfyUI/models/LLM'"
+    DESCRIPTION = "Loads Wan text_encoder model from 'ComfyUI/models/LLM'"
 
     def loadmodel(self, model_name, precision, load_device="offload_device", quantization="disabled"):
        
@@ -789,7 +789,7 @@ class LoadWanVideoClipTextEncoder:
     RETURN_NAMES = ("wan_clip_vision", )
     FUNCTION = "loadmodel"
     CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Loads Hunyuan text_encoder model from 'ComfyUI/models/text_encoders'"
+    DESCRIPTION = "Loads Wan text_encoder model from 'ComfyUI/models/text_encoders'"
 
     def loadmodel(self, model_name, precision, load_device="offload_device"):
        
@@ -1175,6 +1175,23 @@ class WanVideoFlowEdit:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Flowedit options for WanVideo"
+
+    def process(self, **kwargs):
+        return (kwargs,)
+    
+class WanVideoLoopArgs:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                "shift_skip": ("INT", {"default": 6, "min": 0, "tooltip": "Skip step of latent shift"}),
+            },
+        }
+
+    RETURN_TYPES = ("LOOPARGS", )
+    RETURN_NAMES = ("loop_args",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Looping through latent shift as shown in https://github.com/YisuiTT/Mobius/"
 
     def process(self, **kwargs):
         return (kwargs,)
@@ -1602,7 +1619,14 @@ class WanVideoSampler:
             thresholds = thresholds.unsqueeze(1).unsqueeze(1).unsqueeze(1).unsqueeze(1).to(device)
             masks = mask.repeat(len(timesteps), 1, 1, 1, 1).to(device) 
             masks = masks > thresholds
-        
+
+        latent_shift_loop = False
+        if loop_args is not None:
+            latent_shift_loop = True
+            is_looped = True
+            latent_skip = loop_args["shift_skip"]
+            shift_idx = 0
+        #main loop start
         for idx, t in enumerate(tqdm(timesteps)):    
             if flowedit_args is not None:
                 if idx < skip_steps:
@@ -1621,6 +1645,11 @@ class WanVideoSampler:
                     # end diff diff
 
             latent_model_input = latent.to(device)
+
+            ### latent shift
+            if latent_shift_loop:
+                latent_model_input = torch.cat([latent_model_input[:, shift_idx:]] + [latent_model_input[:, :shift_idx]], dim=1)
+
             timestep = torch.tensor([t]).to(device)
             current_step_percentage = idx / len(timesteps)
 
@@ -1989,6 +2018,12 @@ class WanVideoSampler:
                     text_embeds["negative_prompt_embeds"], 
                     timestep, idx, image_cond, clip_fea,
                     teacache_state=self.teacache_state)
+
+            if latent_shift_loop:
+                #reverse latent shift
+                noise_pred = torch.cat([noise_pred[:, latent_video_length - shift_idx:]] + [noise_pred[:, :latent_video_length - shift_idx]], dim=1)
+                shift_idx = (shift_idx + latent_skip) % latent_video_length
+                
             
             if flowedit_args is None:
                 latent = latent.to(intermediate_device)
@@ -2293,6 +2328,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoGranularTextEncode": WanVideoGranularTextEncode,
     "WanVideoSmartSampler": WanVideoSmartSampler,
 }
+
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
     "WanVideoDecode": "WanVideo Decode",
