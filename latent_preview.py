@@ -84,12 +84,12 @@ def get_previewer(device, latent_format):
             taew_sd = comfy.utils.load_torch_file(taehv_path)
             taesd = TAEHV(taew_sd).to(device)
             previewer = TAESDPreviewerImpl(taesd)
-            previewer = WrappedPreviewer(previewer)
+            previewer = WrappedPreviewer(previewer, rate=16)
 
         if previewer is None:
             if latent_format.latent_rgb_factors is not None:
                 previewer = Latent2RGBPreviewer(latent_format.latent_rgb_factors, latent_format.latent_rgb_factors_bias)
-                previewer = WrappedPreviewer(previewer)
+                previewer = WrappedPreviewer(previewer, rate=4)
     return previewer
 
 def prepare_callback(model, steps, x0_output_dict=None):
@@ -182,7 +182,10 @@ class WrappedPreviewer(LatentPreviewer):
             #NOTE: send sync already uses call_soon_threadsafe
             serv.send_sync(server.BinaryEventTypes.PREVIEW_IMAGE,
                            message.getvalue(), serv.client_id)
-            ind = (ind + 1) % ((leng-1) * 4 - 1)
+            if self.rate == 16:
+                ind = (ind + 1) % ((leng-1) * 4 - 1)
+            else:
+                ind = (ind + 1) % leng
     def decode_latent_to_preview(self, x0):
         if hasattr(self, 'taesd'):
             x0 = x0.unsqueeze(0)
