@@ -1728,8 +1728,30 @@ class WanVideoSampler:
                         counter = torch.zeros_like(zt_src, device=intermediate_device)
                         vt_src = torch.zeros_like(zt_src, device=intermediate_device)
                         context_queue = list(context(idx, steps, latent_video_length, context_frames, context_stride, context_overlap))
+                        # for c in context_queue:
+                        #     window_id = self.window_tracker.get_window_id(c)
+                        # Modify the WanVideoSampler code where it handles RoPE setup
                         for c in context_queue:
+                            # Get the actual window size for this context window
                             window_id = self.window_tracker.get_window_id(c)
+                            window_size = len(c)
+                            
+                            # Reset RoPE variables for this specific window
+                            if rope_function == "comfy":
+                                # Instead of setting for the full video length, set for this window
+                                transformer.rope_embedder.k = riflex_freq_index
+                                transformer.rope_embedder.num_frames = window_size  # <-- KEY CHANGE
+                            else:
+                                # For default, calculate frequencies specifically for this window
+                                d = transformer.dim // transformer.num_heads
+                                freqs = torch.cat([
+                                    rope_params(1024, d - 4 * (d // 6), L_test=window_size, k=riflex_freq_index),
+                                    rope_params(1024, 2 * (d // 6)),
+                                    rope_params(1024, 2 * (d // 6))
+                                ], dim=1)
+                                
+                            # Now use local_freqs or the updated transformer.rope_embedder.num_frames 
+                            # in the processing code for this window
 
                             if teacache_args is not None:
                                 current_teacache = self.window_tracker.get_teacache(window_id, self.teacache_state)
@@ -1822,8 +1844,30 @@ class WanVideoSampler:
                     counter = torch.zeros_like(zt_tgt, device=intermediate_device)
                     vt_tgt = torch.zeros_like(zt_tgt, device=intermediate_device)
                     context_queue = list(context(idx, steps, latent_video_length, context_frames, context_stride, context_overlap))
+                    # for c in context_queue:
+                    #     window_id = self.window_tracker.get_window_id(c)
+                    # Modify the WanVideoSampler code where it handles RoPE setup
                     for c in context_queue:
+                        # Get the actual window size for this context window
+                        window_size = len(c)
                         window_id = self.window_tracker.get_window_id(c)
+                        
+                        # Reset RoPE variables for this specific window
+                        if rope_function == "comfy":
+                            # Instead of setting for the full video length, set for this window
+                            transformer.rope_embedder.k = riflex_freq_index
+                            transformer.rope_embedder.num_frames = window_size  # <-- KEY CHANGE
+                        else:
+                            # For default, calculate frequencies specifically for this window
+                            d = transformer.dim // transformer.num_heads
+                            freqs = torch.cat([
+                                rope_params(1024, d - 4 * (d // 6), L_test=window_size, k=riflex_freq_index),
+                                rope_params(1024, 2 * (d // 6)),
+                                rope_params(1024, 2 * (d // 6))
+                            ], dim=1)
+                            
+                        # Now use local_freqs or the updated transformer.rope_embedder.num_frames 
+                        # in the processing code for this window
 
                         if teacache_args is not None:
                             current_teacache = self.window_tracker.get_teacache(window_id, self.teacache_state)
@@ -1917,8 +1961,30 @@ class WanVideoSampler:
                 noise_pred = torch.zeros_like(latent_model_input, device=intermediate_device)
                 context_queue = list(context(idx, steps, latent_video_length, context_frames, context_stride, context_overlap))
                 
+                # for c in context_queue:
+                #     window_id = self.window_tracker.get_window_id(c)
+                # Modify the WanVideoSampler code where it handles RoPE setup
                 for c in context_queue:
+                    # Get the actual window size for this context window
+                    window_size = len(c)
                     window_id = self.window_tracker.get_window_id(c)
+                    
+                    # Reset RoPE variables for this specific window
+                    if rope_function == "comfy":
+                        # Instead of setting for the full video length, set for this window
+                        transformer.rope_embedder.k = riflex_freq_index
+                        transformer.rope_embedder.num_frames = window_size  # <-- KEY CHANGE
+                    else:
+                        # For default, calculate frequencies specifically for this window
+                        d = transformer.dim // transformer.num_heads
+                        freqs = torch.cat([
+                            rope_params(1024, d - 4 * (d // 6), L_test=window_size, k=riflex_freq_index),
+                            rope_params(1024, 2 * (d // 6)),
+                            rope_params(1024, 2 * (d // 6))
+                        ], dim=1)
+                        
+                    # Now use local_freqs or the updated transformer.rope_embedder.num_frames 
+                    # in the processing code for this window
                     
                     if teacache_args is not None:
                         current_teacache = self.window_tracker.get_teacache(window_id, self.teacache_state)
